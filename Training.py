@@ -28,7 +28,7 @@ class EarlyStopping:
         self.counter = 0
         self.best_score = None
         self.early_stop = False
-        self.val_loss_min = np.Inf
+        self.val_loss_min = np.inf
         
     def __call__(self, val_loss, model, optimizer, scheduler, epoch, save_path):
         score = -val_loss if self.mode == 'min' else val_loss
@@ -535,7 +535,7 @@ def train_model(config, resume_from=None):
             if 'early_stopping_state' in checkpoint:
                 early_stopping.counter = checkpoint['early_stopping_state'].get('counter', 0)
                 early_stopping.best_score = checkpoint['early_stopping_state'].get('best_score', None)
-                early_stopping.val_loss_min = checkpoint['early_stopping_state'].get('val_loss_min', np.Inf)
+                early_stopping.val_loss_min = checkpoint['early_stopping_state'].get('val_loss_min', np.inf)
             
             print(f"  Resumed from epoch {start_epoch}")
             print(f"  Best val loss: {best_val_loss:.4f}")

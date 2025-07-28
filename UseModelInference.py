@@ -319,8 +319,8 @@ def demo_inference():
     print("EXAMPLE 1: Single Image Detection")
     print("="*50)
     
-    # You would replace this with your actual image path
-    test_image_path = "RePictures/apple/apple_1.jpg"  # Example
+    # Replace this with actual image path
+    test_image_path = "ResizedExtendingPictures/Apple/20250716_200951_016.jpg"
     
     if os.path.exists(test_image_path):
         results = detector.detect(test_image_path, score_threshold=0.5)
@@ -328,17 +328,15 @@ def demo_inference():
         detector.visualize(results, save_path="detection_result.png")
     else:
         print("Test image not found. Creating a dummy example...")
-        # Create a black 1200x1200 image as example
         dummy_image = np.zeros((1200, 1200, 3), dtype=np.uint8)
         results = detector.detect(dummy_image, score_threshold=0.5)
         detector.print_summary(results)
     
-    # Example 2: Process entire directory
     print("\n" + "="*50)
     print("EXAMPLE 2: Batch Processing")
     print("="*50)
     
-    input_directory = "RePictures/"  # Your test images directory
+    input_directory = "ResizedExtendingPictures/Cherry/"  # Your test images directory
     output_directory = "detection_results/"
     
     if os.path.exists(input_directory):

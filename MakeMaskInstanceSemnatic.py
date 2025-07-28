@@ -540,6 +540,7 @@ def create_augmented_dataset(original_images_dir, masks_dir, augmented_output_di
                            augmentation_params=None, augmentations_per_image=8):
     """
     Create augmented dataset from original images and masks.
+    Fixed version that properly matches images with their corresponding masks.
     """
     if augmentation_params is None:
         augmentation_params = {
@@ -597,6 +598,49 @@ def create_augmented_dataset(original_images_dir, masks_dir, augmented_output_di
     total_augmented = 0
     augmentation_log = []
     
+    def find_image_file_in_plant_dir(base_name, plant_type, images_dir):
+        """
+        Find image file specifically in the plant type directory
+        """
+        # First try in plant-specific directory
+        plant_img_dir = os.path.join(images_dir, plant_type)
+        if os.path.exists(plant_img_dir):
+            for ext in ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG']:
+                img_path = os.path.join(plant_img_dir, f"{base_name}{ext}")
+                if os.path.exists(img_path):
+                    return img_path, ext
+        
+        # If not found, search recursively but prioritize matching plant type in path
+        for root, _, files in os.walk(images_dir):
+            # Check if this directory contains the plant type
+            if plant_type.lower() in root.lower() or plant_type in root:
+                for ext in ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG']:
+                    filename = f"{base_name}{ext}"
+                    if filename in files:
+                        return os.path.join(root, filename), ext
+        
+        # Last resort: search everywhere
+        for root, _, files in os.walk(images_dir):
+            for ext in ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG']:
+                filename = f"{base_name}{ext}"
+                if filename in files:
+                    return os.path.join(root, filename), ext
+        
+        return None, None
+    
+    # Debug: Print directory structure
+    print(f"Semantic masks directory: {semantic_masks_dir}")
+    print(f"Original images directory: {original_images_dir}")
+    
+    # Get list of plant types that should be processed
+    processed_plants = []
+    for plant_dir in os.listdir(semantic_masks_dir):
+        plant_path = os.path.join(semantic_masks_dir, plant_dir)
+        if os.path.isdir(plant_path):
+            processed_plants.append(plant_dir)
+    
+    print(f"Plant types found in masks: {processed_plants}")
+    
     for root, dirs, files in os.walk(semantic_masks_dir):
         for filename in files:
             if filename.endswith('_semantic.png'):
@@ -604,32 +648,47 @@ def create_augmented_dataset(original_images_dir, masks_dir, augmented_output_di
                 rel_path = os.path.relpath(root, semantic_masks_dir)
                 plant_type = rel_path if rel_path != '.' else 'unknown'
                 
+                print(f"Processing {plant_type}/{base_name}")
+                
                 # Create plant-specific directories
                 for dir_path in [aug_images_dir, aug_semantic_dir, aug_instance_dir, aug_panoptic_dir]:
                     plant_dir = os.path.join(dir_path, plant_type)
                     os.makedirs(plant_dir, exist_ok=True)
                 
-                # Find original image
-                orig_image_path = None
-                for ext in ['.jpg', '.jpeg', '.png']:
-                    for img_root, _, img_files in os.walk(original_images_dir):
-                        if f"{base_name}{ext}" in img_files:
-                            orig_image_path = os.path.join(img_root, f"{base_name}{ext}")
-                            orig_ext = ext
-                            break
-                    if orig_image_path:
-                        break
+                # Find original image using improved search
+                orig_image_path, orig_ext = find_image_file_in_plant_dir(base_name, plant_type, original_images_dir)
                 
                 if not orig_image_path:
-                    print(f"Warning: Original image not found for {base_name}")
+                    print(f"Warning: Original image not found for {plant_type}/{base_name}")
+                    # List available files for debugging
+                    plant_img_dir = os.path.join(original_images_dir, plant_type)
+                    if os.path.exists(plant_img_dir):
+                        available_files = os.listdir(plant_img_dir)[:5]  # Show first 5 files
+                        print(f"  Available files in {plant_type}: {available_files}")
+                    continue
+                
+                print(f"Found image: {orig_image_path}")
+                
+                # Build paths for all mask types
+                semantic_path = os.path.join(root, filename)
+                instance_path = os.path.join(instance_masks_dir, plant_type, f"{base_name}_instance.png")
+                panoptic_path = os.path.join(panoptic_masks_dir, plant_type, f"{base_name}_panoptic.png")
+                
+                # Check if all required files exist
+                if not all(os.path.exists(p) for p in [orig_image_path, semantic_path, instance_path, panoptic_path]):
+                    print(f"Warning: Not all files found for {base_name}")
+                    print(f"  Image: {os.path.exists(orig_image_path)}")
+                    print(f"  Semantic: {os.path.exists(semantic_path)}")
+                    print(f"  Instance: {os.path.exists(instance_path)}")
+                    print(f"  Panoptic: {os.path.exists(panoptic_path)}")
                     continue
                 
                 # Load original image and masks
                 try:
                     original_image = Image.open(orig_image_path).convert('RGB')
-                    semantic_mask = Image.open(os.path.join(root, filename))
-                    instance_mask = Image.open(os.path.join(instance_masks_dir, plant_type, f"{base_name}_instance.png"))
-                    panoptic_mask = Image.open(os.path.join(panoptic_masks_dir, plant_type, f"{base_name}_panoptic.png"))
+                    semantic_mask = Image.open(semantic_path)
+                    instance_mask = Image.open(instance_path)
+                    panoptic_mask = Image.open(panoptic_path)
                     
                     # Copy originals with _original suffix
                     original_image.save(os.path.join(aug_images_dir, plant_type, f"{base_name}_original{orig_ext}"))
@@ -674,10 +733,12 @@ def create_augmented_dataset(original_images_dir, masks_dir, augmented_output_di
                         
                         total_augmented += 1
                         
-                    print(f"Generated {augmentations_per_image} augmentations for {base_name}")
+                    print(f"Generated {augmentations_per_image} augmentations for {plant_type}/{base_name}")
                     
                 except Exception as e:
-                    print(f"Error processing {base_name}: {e}")
+                    print(f"Error processing {plant_type}/{base_name}: {e}")
+                    import traceback
+                    traceback.print_exc()
     
     # Save augmentation log
     log_path = os.path.join(augmented_output_dir, 'augmentation_log.json')
