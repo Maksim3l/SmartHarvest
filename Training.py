@@ -12,1035 +12,1035 @@ import cv2
 import os
 import matplotlib.pyplot as plt
 from pathlib import Path
-import torch.nn.functional as F
+import random
+from datetime import datetime
+import time
+from collections import deque
+
+
+class EarlyStopping:
+    """Early stopping to prevent overfitting"""
+    def __init__(self, patience=10, min_delta=0.001, mode='min', verbose=True):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.Inf
+        
+    def __call__(self, val_loss, model, optimizer, scheduler, epoch, save_path):
+        score = -val_loss if self.mode == 'min' else val_loss
+        
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model, optimizer, scheduler, epoch, save_path)
+        elif score < self.best_score + self.min_delta:
+            self.counter += 1
+            if self.verbose:
+                print(f'  EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model, optimizer, scheduler, epoch, save_path)
+            self.counter = 0
+    
+    def save_checkpoint(self, val_loss, model, optimizer, scheduler, epoch, save_path):
+        """Saves model when validation loss decreases"""
+        if self.verbose:
+            print(f'  Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}). Saving model...')
+        
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'val_loss': val_loss,
+            'best_score': self.best_score,
+            'early_stopping_counter': self.counter
+        }
+        torch.save(checkpoint, save_path)
+        self.val_loss_min = val_loss
 
 
 class FruitInstanceDataset(Dataset):
-    def __init__(self, json_file, images_dir, transform=None, target_size=(1200, 1200), include_negatives=True):
+    """Dataset for fruit instance segmentation using pre-generated masks"""
+    
+    def __init__(self, images_dir, masks_dir, transform=None, split='train', augment=True):
         self.images_dir = images_dir
+        self.masks_dir = masks_dir
         self.transform = transform
-        self.target_size = target_size
-        self.include_negatives = include_negatives
-
-        with open(json_file, 'r') as f:
-            self.annotations = json.load(f)
-
+        self.split = split
+        self.augment = augment and (split == 'train')
+        
+        # Class mapping - 5 fruits × 3 ripeness states = 15 classes + background
         self.class_map = {
             'apple': {'ripe': 1, 'unripe': 2, 'spoiled': 3},
             'cherry': {'ripe': 4, 'unripe': 5, 'spoiled': 6},
             'cucumber': {'ripe': 7, 'unripe': 8, 'spoiled': 9},
-            'lettuce': {'ripe': 10, 'unripe': 11, 'spoiled': 12},
-            'pear': {'ripe': 13, 'unripe': 14, 'spoiled': 15},
-            'pepper': {'ripe': 16, 'unripe': 17, 'spoiled': 18},
-            'raspberry': {'ripe': 19, 'unripe': 20, 'spoiled': 21},
-            'strawberry': {'ripe': 22, 'unripe': 23, 'spoiled': 24},
-            'tomato': {'ripe': 25, 'unripe': 26, 'spoiled': 27},
+            'strawberry': {'ripe': 10, 'unripe': 11, 'spoiled': 12},
+            'tomato': {'ripe': 13, 'unripe': 14, 'spoiled': 15},
         }
-
+        
+        # Fruits to skip
+        self.skip_fruits = {'pear', 'pepper', 'raspberry', 'lettuce'}
+        
+        # Build class names for display
         self.class_names = ['background']
         for plant, ripeness_dict in self.class_map.items():
-            for ripeness, class_id in ripeness_dict.items():
+            for ripeness in ['ripe', 'unripe', 'spoiled']:
                 self.class_names.append(f"{plant}-{ripeness}")
-
-        # Process all samples - both positive (with annotations) and negative (background)
+        
         self.samples = []
-        positive_samples = 0
-        negative_samples = 0
+        self._load_samples()
         
-        for key, image_data in self.annotations.items():
-            if (isinstance(image_data, dict) and 
-                'filename' in image_data and 
-                'regions' in image_data):
+        print(f"Dataset initialized: {len(self.samples)} samples for {split}")
+        print(f"Allowed fruits: {', '.join(self.class_map.keys())}")
+        print(f"Augmentation: {'Enabled' if self.augment else 'Disabled'}")
         
-                plant = image_data.get('file_attributes', {}).get('plant', '').lower()
-                regions = image_data['regions']
+    def _load_samples(self):
+        """Load all valid samples from mask directories"""
+        semantic_dir = os.path.join(self.masks_dir, 'semantic_masks')
+        instance_dir = os.path.join(self.masks_dir, 'instance_masks')
         
-                # Process regions and keep only valid ones
-                valid_regions = []
-                for region in regions:
-                    if (region and 
-                        isinstance(region, dict) and
-                        'shape_attributes' in region and
-                        'region_attributes' in region and
-                        region.get('shape_attributes', {}).get('name') == 'polygon'):
-                        
-                        x_points = region['shape_attributes'].get('all_points_x', [])
-                        y_points = region['shape_attributes'].get('all_points_y', [])
-                        
-                        if len(x_points) >= 3 and len(y_points) >= 3:
-                            ripeness = region.get('region_attributes', {}).get('ripeness_factor', 'ripe')
-                            if plant in self.class_map and ripeness in self.class_map[plant]:
-                                valid_regions.append(region)
+        if not os.path.exists(semantic_dir) or not os.path.exists(instance_dir):
+            raise ValueError(f"Mask directories not found in {self.masks_dir}")
         
-                # Store the cleaned version
-                cleaned_data = image_data.copy()
-                cleaned_data['regions'] = valid_regions
-                cleaned_data['is_negative'] = len(valid_regions) == 0
-                
-                # Always include the sample (positive or negative)
-                if len(valid_regions) > 0:
-                    positive_samples += 1
-                else:
-                    negative_samples += 1
+        # Walk through semantic masks
+        for root, dirs, files in os.walk(semantic_dir):
+            for filename in files:
+                if not filename.endswith('_semantic.png'):
+                    continue
                     
-                if self.include_negatives or len(valid_regions) > 0:
-                    self.samples.append(cleaned_data)
-
-        print(f"Dataset loaded:")
-        print(f"  - Positive samples (with annotations): {positive_samples}")
-        print(f"  - Negative samples (background only): {negative_samples}")
-        print(f"  - Total samples: {len(self.samples)}")
-        
-        if not self.include_negatives:
-            print(f"  - Using only positive samples for training")
-
+                base_name = filename.replace('_semantic.png', '')
+                
+                # Get plant type from directory
+                rel_path = os.path.relpath(root, semantic_dir)
+                plant_type = rel_path if rel_path != '.' else 'unknown'
+                
+                # Skip excluded fruits
+                if plant_type in self.skip_fruits:
+                    continue
+                
+                # Only process allowed fruits
+                if plant_type not in self.class_map:
+                    continue
+                
+                # Build paths
+                semantic_path = os.path.join(root, filename)
+                instance_path = os.path.join(root.replace(semantic_dir, instance_dir), 
+                                           f"{base_name}_instance.png")
+                info_path = os.path.join(root.replace(semantic_dir, instance_dir), 
+                                       f"{base_name}_instances.json")
+                
+                # Find original image
+                image_path = None
+                for ext in ['.jpg', '.jpeg', '.png', '.bmp']:
+                    for img_root, _, img_files in os.walk(self.images_dir):
+                        if f"{base_name}{ext}" in img_files:
+                            image_path = os.path.join(img_root, f"{base_name}{ext}")
+                            break
+                    if image_path:
+                        break
+                
+                # Verify all files exist
+                if (image_path and os.path.exists(image_path) and 
+                    os.path.exists(semantic_path) and os.path.exists(instance_path)):
+                    
+                    self.samples.append({
+                        'image_path': image_path,
+                        'semantic_path': semantic_path,
+                        'instance_path': instance_path,
+                        'info_path': info_path if os.path.exists(info_path) else None,
+                        'plant_type': plant_type,
+                        'base_name': base_name
+                    })
+    
     def __len__(self):
         return len(self.samples)
     
     def __getitem__(self, idx):
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                current_idx = (idx + attempt) % len(self.samples)
-                image_data = self.samples[current_idx]
-                filename = image_data['filename']
-                plant_type = image_data.get('file_attributes', {}).get('plant', 'unknown').lower()
-                regions = image_data['regions']
-                is_negative = image_data.get('is_negative', False)
+        sample = self.samples[idx]
+        
+        try:
+            # Load image
+            image = cv2.imread(sample['image_path'])
+            if image is None:
+                raise ValueError(f"Failed to load image: {sample['image_path']}")
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            height, width = image.shape[:2]
+            
+            # Load masks
+            instance_mask = np.array(Image.open(sample['instance_path']))
+            
+            # Load instance info
+            if sample['info_path'] and os.path.exists(sample['info_path']):
+                with open(sample['info_path'], 'r') as f:
+                    instance_info = json.load(f)
+            else:
+                raise ValueError(f"Instance info not found: {sample['info_path']}")
+            
+            # Parse instances
+            boxes = []
+            labels = []
+            masks = []
+            areas = []
+            
+            for inst in instance_info.get('instances', []):
+                instance_id = inst['instance_id']
+                semantic_class_id = inst['semantic_class_id']
+                bbox = inst['bbox']  # [x1, y1, x2, y2]
+                area = inst['area']
                 
-                image_path = self.find_image_file(filename)
-                if not image_path:
-                    if attempt == max_retries - 1:
-                        raise ValueError(f"Image not found: {filename}")
+                # Skip if class not in our mapping
+                if semantic_class_id > 15:
                     continue
-        
-                image = cv2.imread(image_path)
-                if image is None:
-                    if attempt == max_retries - 1:
-                        raise ValueError(f"Could not load image: {image_path}")
+                
+                # Extract instance mask
+                instance_pixels = (instance_mask == instance_id)
+                
+                # Skip very small instances
+                if np.sum(instance_pixels) < 100:
                     continue
-                    
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                height, width = image.shape[:2]
-
-                boxes = []
-                labels = []
-                masks = []
-                areas = []
-
-                # Process annotations (if any)
-                for region in regions:
-                    if not region or not isinstance(region, dict):
-                        continue
-                        
-                    shape_attrs = region.get('shape_attributes', {})
-                    if shape_attrs.get('name') != 'polygon':
-                        continue
-
-                    x_points = shape_attrs.get('all_points_x', [])
-                    y_points = shape_attrs.get('all_points_y', [])
-
-                    if len(x_points) < 3 or len(y_points) < 3 or len(x_points) != len(y_points):
-                        continue
-
-                    # Ensure coordinates are within image bounds
-                    x_points = [max(0, min(width-1, x)) for x in x_points]
-                    y_points = [max(0, min(height-1, y)) for y in y_points]
-
-                    polygon_coords = [(x, y) for x, y in zip(x_points, y_points)]
-                    mask = np.zeros((height, width), dtype=np.uint8)
-                    
-                    try:
-                        cv2.fillPoly(mask, [np.array(polygon_coords, dtype=np.int32)], 1)
-                    except Exception as e:
-                        continue
-                        
-                    area = np.sum(mask)
-                    if area < 100:  # Skip very small masks
-                        continue
-
-                    pos = np.where(mask)
-                    if len(pos[0]) == 0:
-                        continue
-
-                    xmin, xmax = np.min(pos[1]), np.max(pos[1])
-                    ymin, ymax = np.min(pos[0]), np.max(pos[0])
-
-                    # Ensure valid bounding box
-                    if xmax <= xmin or ymax <= ymin or (xmax - xmin) < 5 or (ymax - ymin) < 5:
-                        continue
-
-                    ripeness = region.get('region_attributes', {}).get('ripeness_factor', 'ripe')
                 
-                    if plant_type in self.class_map and ripeness in self.class_map[plant_type]:
-                        label = self.class_map[plant_type][ripeness]
-                    else:
-                        continue
-
-                    boxes.append([xmin, ymin, xmax, ymax])
-                    labels.append(label)
-                    masks.append(mask)
-                    areas.append(area)
-
-                # Create proper empty tensors for negative samples (background images)
-                if len(boxes) == 0:
-                    # This is a negative sample - no objects present
-                    boxes = torch.zeros((0, 4), dtype=torch.float32)
-                    labels = torch.zeros((0,), dtype=torch.int64)
-                    masks = torch.zeros((0, height, width), dtype=torch.uint8)
-                    areas = torch.zeros((0,), dtype=torch.float32)
-                    iscrowd = torch.zeros((0,), dtype=torch.int64)
-                else:
-                    # This is a positive sample - convert to tensors
-                    boxes = torch.as_tensor(boxes, dtype=torch.float32)
-                    labels = torch.as_tensor(labels, dtype=torch.int64)
-                    masks = torch.as_tensor(np.array(masks), dtype=torch.uint8)
-                    areas = torch.as_tensor(areas, dtype=torch.float32)
-                    iscrowd = torch.zeros((len(labels),), dtype=torch.int64)
-
-                target = {
-                    'boxes': boxes,
-                    'labels': labels,
-                    'masks': masks,
-                    'area': areas,
-                    'iscrowd': iscrowd,
-                    'image_id': torch.tensor([current_idx]),
-                    'is_negative': is_negative  # Flag for tracking
-                }
-        
-                if self.transform:
-                    image = Image.fromarray(image)
-                    image = self.transform(image)
-                else:
-                    image = transforms.ToTensor()(Image.fromarray(image))
-        
-                return image, target
+                # Validate bbox
+                x1, y1, x2, y2 = bbox
+                if x2 <= x1 or y2 <= y1:
+                    continue
                 
-            except Exception as e:
-                print(f"Error processing sample {current_idx} (attempt {attempt + 1}): {e}")
-                if attempt == max_retries - 1:
-                    raise e
-                continue
+                boxes.append([x1, y1, x2, y2])
+                labels.append(semantic_class_id)
+                masks.append(instance_pixels.astype(np.uint8))
+                areas.append(area)
+            
+            # Convert to tensors
+            if len(boxes) > 0:
+                boxes = torch.as_tensor(boxes, dtype=torch.float32)
+                labels = torch.as_tensor(labels, dtype=torch.int64)
+                masks = torch.as_tensor(np.array(masks), dtype=torch.uint8)
+                areas = torch.as_tensor(areas, dtype=torch.float32)
+                iscrowd = torch.zeros((len(labels),), dtype=torch.int64)
+            else:
+                # Empty sample
+                boxes = torch.zeros((0, 4), dtype=torch.float32)
+                labels = torch.zeros((0,), dtype=torch.int64)
+                masks = torch.zeros((0, height, width), dtype=torch.uint8)
+                areas = torch.zeros((0,), dtype=torch.float32)
+                iscrowd = torch.zeros((0,), dtype=torch.int64)
+            
+            target = {
+                'boxes': boxes,
+                'labels': labels,
+                'masks': masks,
+                'area': areas,
+                'iscrowd': iscrowd,
+                'image_id': torch.tensor([idx])
+            }
+            
+            # Apply transforms
+            if self.transform:
+                image = Image.fromarray(image)
+                image = self.transform(image)
+            else:
+                image = transforms.ToTensor()(Image.fromarray(image))
+            
+            return image, target
+            
+        except Exception as e:
+            print(f"Error loading sample {idx}: {e}")
+            # Return empty sample on error
+            empty_image = torch.zeros((3, 1200, 1200))
+            empty_target = {
+                'boxes': torch.zeros((0, 4), dtype=torch.float32),
+                'labels': torch.zeros((0,), dtype=torch.int64),
+                'masks': torch.zeros((0, 1200, 1200), dtype=torch.uint8),
+                'area': torch.zeros((0,), dtype=torch.float32),
+                'iscrowd': torch.zeros((0,), dtype=torch.int64),
+                'image_id': torch.tensor([idx])
+            }
+            return empty_image, empty_target
+
+
+def get_model(num_classes, dropout_rate=0.5, pretrained_backbone=True):
+    """Get Mask R-CNN model with custom number of classes and dropout"""
+    # Load model with pretrained weights
+    model = maskrcnn_resnet50_fpn(
+        weights='DEFAULT' if pretrained_backbone else None,
+        weights_backbone='DEFAULT' if pretrained_backbone else None
+    )
     
-    def find_image_file(self, filename):
-        direct_path = os.path.join(self.images_dir, filename)
-        if os.path.exists(direct_path):
-            return direct_path
-        for root, _, files in os.walk(self.images_dir):
-            if filename in files:
-                return os.path.join(root, filename)
-        return None
-
-
-def get_instance_model(num_classes):
-    """Create Mask R-CNN model with custom number of classes."""
-    model = maskrcnn_resnet50_fpn(weights='DEFAULT')
+    # Get number of input features for the classifier
     in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    
+    # Replace the box predictor with dropout
+    model.roi_heads.box_predictor = FastRCNNPredictorWithDropout(
+        in_features, num_classes, dropout_rate
+    )
+    
+    # Replace the mask predictor
     in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
     hidden_layer = 256
     model.roi_heads.mask_predictor = MaskRCNNPredictor(
         in_features_mask, hidden_layer, num_classes
     )
+    
     return model
 
 
+class FastRCNNPredictorWithDropout(nn.Module):
+    """Box predictor with dropout for regularization"""
+    def __init__(self, in_channels, num_classes, dropout_rate=0.5):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout_rate)
+        self.cls_score = nn.Linear(in_channels, num_classes)
+        self.bbox_pred = nn.Linear(in_channels, num_classes * 4)
+        
+    def forward(self, x):
+        if x.dim() == 4:
+            assert list(x.shape[2:]) == [1, 1]
+        x = x.flatten(start_dim=1)
+        x = self.dropout(x)
+        scores = self.cls_score(x)
+        bbox_deltas = self.bbox_pred(x)
+        return scores, bbox_deltas
+
+
 def collate_fn(batch):
-    """Custom collate function that properly handles both positive and negative samples."""
-    batch = [item for item in batch if item is not None]
+    """Custom collate function for handling batches"""
+    batch = list(filter(lambda x: x is not None, batch))
     if len(batch) == 0:
         return None, None
     return tuple(zip(*batch))
 
 
-def train_instance_model():
-    """Main training function for the instance segmentation model."""
-    config = {
-        'batch_size': 4,
-        'learning_rate': 5e-4,
-        'num_epochs': 50,
-        'num_classes': 28,
-        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'save_dir': 'instance_checkpoints',
-        'warmup_epochs': 5,
-        'print_freq': 10,
-        'include_negatives': True
-    }
+class ModelCheckpointer:
+    """Handles model checkpointing and recovery"""
+    def __init__(self, save_dir, max_checkpoints=3):
+        self.save_dir = save_dir
+        self.max_checkpoints = max_checkpoints
+        self.checkpoints = deque(maxlen=max_checkpoints)
+        os.makedirs(save_dir, exist_ok=True)
+        
+    def save_checkpoint(self, model, optimizer, scheduler, epoch, train_loss, val_loss, 
+                       early_stopping_state, config, is_best=False):
+        """Save a checkpoint"""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'train_loss': train_loss,
+            'val_loss': val_loss,
+            'early_stopping_state': early_stopping_state,
+            'config': config,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        # Save best model separately
+        if is_best:
+            best_path = os.path.join(self.save_dir, 'best_model.pth')
+            torch.save(checkpoint, best_path)
+            print(f"  ✓ Saved best model (val_loss: {val_loss:.4f})")
+        
+        # Save regular checkpoint
+        checkpoint_name = f'checkpoint_epoch_{epoch:03d}.pth'
+        checkpoint_path = os.path.join(self.save_dir, checkpoint_name)
+        torch.save(checkpoint, checkpoint_path)
+        
+        # Manage checkpoint history
+        self.checkpoints.append(checkpoint_path)
+        if len(self.checkpoints) > self.max_checkpoints:
+            # Remove oldest checkpoint (except best_model.pth)
+            old_checkpoint = self.checkpoints[0]
+            if os.path.exists(old_checkpoint) and 'best_model' not in old_checkpoint:
+                os.remove(old_checkpoint)
+                
+        return checkpoint_path
+    
+    def load_checkpoint(self, checkpoint_path):
+        """Load a checkpoint"""
+        if not os.path.exists(checkpoint_path):
+            return None
+        return torch.load(checkpoint_path, map_location='cpu')
+    
+    def find_latest_checkpoint(self):
+        """Find the most recent checkpoint"""
+        checkpoints = []
+        for file in os.listdir(self.save_dir):
+            if file.startswith('checkpoint_epoch_') and file.endswith('.pth'):
+                epoch = int(file.split('_')[2].split('.')[0])
+                checkpoints.append((epoch, os.path.join(self.save_dir, file)))
+        
+        if not checkpoints:
+            return None
+        
+        # Sort by epoch and return latest
+        checkpoints.sort(key=lambda x: x[0])
+        return checkpoints[-1][1]
 
-    print(f"Training on device: {config['device']}")
 
-    # Data transforms
-    transform = transforms.Compose([
-        transforms.Resize((1200, 1200)),
+def train_model(config, resume_from=None):
+    """Main training function with anti-overfitting techniques"""
+    print("\n" + "="*50)
+    print("FRUIT INSTANCE SEGMENTATION TRAINING")
+    print("="*50)
+    print(f"Device: {config['device']}")
+    print(f"Batch size: {config['batch_size']}")
+    print(f"Learning rate: {config['learning_rate']}")
+    print(f"Epochs: {config['num_epochs']}")
+    print(f"Early stopping patience: {config['early_stopping_patience']}")
+    print(f"Dropout rate: {config['dropout_rate']}")
+    print(f"Weight decay: {config['weight_decay']}")
+    print(f"Gradient clipping: {config['gradient_clip']}")
+    print("="*50 + "\n")
+    
+    # Create save directory and checkpointer
+    os.makedirs(config['save_dir'], exist_ok=True)
+    checkpointer = ModelCheckpointer(config['save_dir'], max_checkpoints=3)
+    
+    # Setup transforms with more augmentation for training
+    transform_train = transforms.Compose([
+        transforms.ColorJitter(
+            brightness=config['augmentation']['brightness'],
+            contrast=config['augmentation']['contrast'],
+            saturation=config['augmentation']['saturation'],
+            hue=config['augmentation']['hue']
+        ),
+        transforms.RandomHorizontalFlip(0.5),
+        transforms.RandomRotation(degrees=15),
+        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                           std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-
-    # Create dataset
-    dataset = FruitInstanceDataset(
-        json_file="via_export_json(4).json",
-        images_dir="Pictures/",
-        transform=transform,
-        include_negatives=config['include_negatives']
+    
+    transform_val = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    # Create datasets
+    print("Loading datasets...")
+    
+    # Check if using augmented dataset
+    if config.get('use_augmented_dataset', False) and os.path.exists('AugmentedDataset/'):
+        print("Using augmented dataset...")
+        images_dir = 'AugmentedDataset/images/'
+        masks_dir = 'AugmentedDataset/'
+    else:
+        images_dir = config['images_dir']
+        masks_dir = config['masks_dir']
+    
+    full_dataset = FruitInstanceDataset(
+        images_dir=images_dir,
+        masks_dir=masks_dir,
+        transform=None,
+        augment=True
     )
-
+    
     # Split dataset
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(73)
-    )
-
-    print(f"Training set: {len(train_dataset)} images")
-    print(f"Validation set: {len(val_dataset)} images")
-
-    # Create data loaders
+    train_size = int(0.8 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    
+    # Use a fixed seed for reproducible splits
+    generator = torch.Generator().manual_seed(42)
+    indices = torch.randperm(len(full_dataset), generator=generator)
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size:]
+    
+    # Create train and val datasets
+    train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
+    
+    # Apply transforms
+    train_dataset.dataset.transform = transform_train
+    val_dataset.dataset.transform = transform_val
+    
+    print(f"Train samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+    
+    # Create data loaders with smaller batch size to prevent overfitting
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['batch_size'],
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=2,
+        num_workers=config['num_workers'],
         pin_memory=True,
-        drop_last=True
+        drop_last=True  # Drop last incomplete batch
     )
-
+    
     val_loader = DataLoader(
         val_dataset,
         batch_size=config['batch_size'],
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=2,
-        pin_memory=True,
-        drop_last=False
+        num_workers=config['num_workers'],
+        pin_memory=True
     )
-
-    # Initialize model
-    model = get_instance_model(config['num_classes'])
+    
+    # Initialize model with dropout
+    print("\nInitializing model with dropout...")
+    model = get_model(
+        config['num_classes'], 
+        dropout_rate=config['dropout_rate'],
+        pretrained_backbone=True
+    )
     model.to(config['device'])
-
-    # Setup optimizer with different learning rates for backbone and head
-    params = [
-        {'params': [p for n, p in model.named_parameters() if 'backbone' in n], 'lr': config['learning_rate'] * 0.1},
-        {'params': [p for n, p in model.named_parameters() if 'backbone' not in n], 'lr': config['learning_rate']}
-    ]
-
-    optimizer = torch.optim.AdamW(params, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[20, 35], gamma=0.1)
-
-    # Training tracking
+    
+    # Setup optimizer with weight decay
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(
+        params, 
+        lr=config['learning_rate'],
+        momentum=0.9,
+        weight_decay=config['weight_decay']  # L2 regularization
+    )
+    
+    # Learning rate scheduler with warmup
+    def lr_lambda(epoch):
+        if epoch < config['warmup_epochs']:
+            return (epoch + 1) / config['warmup_epochs']
+        else:
+            return config['lr_gamma'] ** ((epoch - config['warmup_epochs']) // config['lr_step_size'])
+    
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
+    # Initialize training variables
+    start_epoch = 0
+    best_val_loss = float('inf')
     train_losses = []
     val_losses = []
-    os.makedirs(config['save_dir'], exist_ok=True)
-
+    
+    # Initialize early stopping
+    early_stopping = EarlyStopping(
+        patience=config['early_stopping_patience'],
+        min_delta=config['early_stopping_delta'],
+        verbose=True
+    )
+    
+    # Resume from checkpoint if specified
+    if resume_from:
+        print(f"\nResuming from checkpoint: {resume_from}")
+        checkpoint = checkpointer.load_checkpoint(resume_from)
+        if checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            best_val_loss = checkpoint.get('val_loss', float('inf'))
+            
+            # Restore early stopping state
+            if 'early_stopping_state' in checkpoint:
+                early_stopping.counter = checkpoint['early_stopping_state'].get('counter', 0)
+                early_stopping.best_score = checkpoint['early_stopping_state'].get('best_score', None)
+                early_stopping.val_loss_min = checkpoint['early_stopping_state'].get('val_loss_min', np.Inf)
+            
+            print(f"  Resumed from epoch {start_epoch}")
+            print(f"  Best val loss: {best_val_loss:.4f}")
+    
     # Training loop
-    for epoch in range(config['num_epochs']):
+    print("\nStarting training...")
+    start_time = time.time()
+    
+    for epoch in range(start_epoch, config['num_epochs']):
+        epoch_start_time = time.time()
         print(f"\nEpoch {epoch+1}/{config['num_epochs']}")
-        print("-" * 50)
-
+        print("-" * 40)
+        
+        # Training phase
         model.train()
-        epoch_loss = 0
+        train_loss = 0.0
         num_batches = 0
-        positive_batches = 0
-        negative_batches = 0
-
+        
         for batch_idx, (images, targets) in enumerate(train_loader):
-            if images is None or targets is None:
+            if images is None:
                 continue
-
+            
             try:
-                images = [img.to(config['device']) for img in images]
-                targets = [{k: v.to(config['device']) if torch.is_tensor(v) else v 
-                           for k, v in t.items()} for t in targets]
+                # Move to device
+                images = list(img.to(config['device']) for img in images)
+                targets = [{k: v.to(config['device']) for k, v in t.items()} for t in targets]
                 
-                # Count positive vs negative samples in batch
-                batch_negatives = sum(1 for t in targets if t.get('is_negative', False))
-                batch_positives = len(targets) - batch_negatives
-                
-                positive_batches += batch_positives
-                negative_batches += batch_negatives
-                
-                # Forward pass - MaskRCNN handles empty targets automatically
-                loss_dict = model(images, targets)
-                
-                if not isinstance(loss_dict, dict) or len(loss_dict) == 0:
+                # Skip batch if no valid targets
+                if any(len(t['boxes']) == 0 for t in targets):
                     continue
                 
+                # Forward pass
+                loss_dict = model(images, targets)
                 losses = sum(loss for loss in loss_dict.values())
                 
+                # Check for valid loss
                 if not torch.isfinite(losses):
-                    print(f"Warning: Non-finite loss at batch {batch_idx}, skipping")
+                    print(f"Warning: Non-finite loss detected, skipping batch")
                     continue
                 
+                # Backward pass
                 optimizer.zero_grad()
                 losses.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                # Gradient clipping to prevent exploding gradients
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), 
+                    max_norm=config['gradient_clip']
+                )
+                
                 optimizer.step()
                 
-                epoch_loss += losses.item()
+                train_loss += losses.item()
                 num_batches += 1
-
+                
+                # Print progress
                 if batch_idx % config['print_freq'] == 0:
-                    print(f"Batch {batch_idx}/{len(train_loader)}, Loss: {losses.item():.4f}")
-                    print(f"  Positive samples: {batch_positives}, Negative samples: {batch_negatives}")
-                    for k, v in loss_dict.items():
-                        print(f"  {k}: {v.item():.4f}")
-                        
+                    loss_components = {k: v.item() for k, v in loss_dict.items()}
+                    print(f"  Batch [{batch_idx}/{len(train_loader)}] "
+                          f"Loss: {losses.item():.4f} "
+                          f"Components: {loss_components}")
+                    
             except Exception as e:
-                print(f"Error in batch {batch_idx}: {e}")
+                print(f"Error in training batch {batch_idx}: {e}")
                 continue
-
-        if num_batches == 0:
-            print("Warning: No valid batches processed in this epoch!")
-            continue
-            
-        avg_train_loss = epoch_loss / num_batches
+        
+        avg_train_loss = train_loss / num_batches if num_batches > 0 else 0
         train_losses.append(avg_train_loss)
         
-        print(f"Epoch {epoch+1} training summary:")
-        print(f"  Total positive samples: {positive_batches}")
-        print(f"  Total negative samples: {negative_batches}")
-
-        # Validation
+        # Validation phase
         model.eval()
-        val_loss = 0
+        val_loss = 0.0
         val_batches = 0
-
+        
         with torch.no_grad():
             for images, targets in val_loader:
-                if images is None or targets is None:
+                if images is None:
                     continue
-                    
+                
                 try:
-                    images = [img.to(config['device']) for img in images]
-                    targets = [{k: v.to(config['device']) if torch.is_tensor(v) else v 
-                               for k, v in t.items()} for t in targets]
+                    images = list(img.to(config['device']) for img in images)
+                    targets = [{k: v.to(config['device']) for k, v in t.items()} for t in targets]
                     
-                    # Switch to train mode for loss computation
+                    # Skip batch if no valid targets
+                    if any(len(t['boxes']) == 0 for t in targets):
+                        continue
+                    
+                    # Get loss (model needs to be in train mode for loss computation)
                     model.train()
                     loss_dict = model(images, targets)
+                    losses = sum(loss for loss in loss_dict.values())
                     model.eval()
                     
-                    if isinstance(loss_dict, dict) and len(loss_dict) > 0:
-                        losses = sum(loss for loss in loss_dict.values())
-                        if torch.isfinite(losses):
-                            val_loss += losses.item()
-                            val_batches += 1
+                    if torch.isfinite(losses):
+                        val_loss += losses.item()
+                        val_batches += 1
                         
                 except Exception as e:
                     continue
-
-        avg_val_loss = val_loss / val_batches if val_batches > 0 else 0
+        
+        avg_val_loss = val_loss / val_batches if val_batches > 0 else float('inf')
         val_losses.append(avg_val_loss)
-        scheduler.step()
-
-        print(f"Training Loss: {avg_train_loss:.4f}")
-        print(f"Validation Loss: {avg_val_loss:.4f}")
-        print(f"Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
-
-        # Save checkpoints
-        if (epoch + 1) % 10 == 0 or epoch == config['num_epochs'] - 1:
-            checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'train_loss': avg_train_loss,
-                'val_loss': avg_val_loss,
-                'config': config,
-                'train_losses': train_losses,
-                'val_losses': val_losses
-            }
-            checkpoint_path = os.path.join(config['save_dir'], f"checkpoint_epoch_{epoch+1}.pth")
-            torch.save(checkpoint, checkpoint_path)
-            print(f"Saved checkpoint: {checkpoint_path}")
-
+        
+        # Update learning rate
+        lr_scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # Epoch timing
+        epoch_time = time.time() - epoch_start_time
+        
+        # Print epoch summary
+        print(f"\nEpoch {epoch+1} Summary:")
+        print(f"  Train Loss: {avg_train_loss:.4f}")
+        print(f"  Val Loss: {avg_val_loss:.4f}")
+        print(f"  Learning Rate: {current_lr:.6f}")
+        print(f"  Epoch Time: {epoch_time:.1f}s")
+        
+        # Early stopping check
+        is_best = avg_val_loss < best_val_loss
+        if is_best:
+            best_val_loss = avg_val_loss
+        
+        # Save checkpoint
+        early_stopping_state = {
+            'counter': early_stopping.counter,
+            'best_score': early_stopping.best_score,
+            'val_loss_min': early_stopping.val_loss_min
+        }
+        
+        checkpoint_path = checkpointer.save_checkpoint(
+            model, optimizer, lr_scheduler, epoch, 
+            avg_train_loss, avg_val_loss, early_stopping_state, 
+            config, is_best=is_best
+        )
+        
+        # Check early stopping
+        early_stopping(avg_val_loss, model, optimizer, lr_scheduler, epoch, 
+                      os.path.join(config['save_dir'], 'early_stop_best.pth'))
+        
+        if early_stopping.early_stop:
+            print("\n Early stopping triggered!")
+            print(f"Best validation loss: {early_stopping.val_loss_min:.4f}")
+            break
+        
+        # Save training curves periodically
+        if (epoch + 1) % 5 == 0:
+            save_training_curves(train_losses, val_losses, config['save_dir'])
+    
+    # Training completed
+    total_time = time.time() - start_time
+    print(f"\n Training completed in {total_time/3600:.2f} hours!")
+    
     # Save final model
-    final_model_path = os.path.join(config['save_dir'], "final_model.pth")
-    torch.save(model.state_dict(), final_model_path)
+    final_path = os.path.join(config['save_dir'], 'final_model.pth')
+    torch.save(model.state_dict(), final_path)
+    print(f" Final model saved to: {final_path}")
+    
+    # Save final training curves
+    save_training_curves(train_losses, val_losses, config['save_dir'])
+    
+    # Save training summary
+    summary = {
+        'config': config,
+        'total_epochs': len(train_losses),
+        'best_val_loss': best_val_loss,
+        'final_train_loss': train_losses[-1] if train_losses else None,
+        'final_val_loss': val_losses[-1] if val_losses else None,
+        'early_stopped': early_stopping.early_stop,
+        'total_time_hours': total_time / 3600
+    }
+    
+    summary_path = os.path.join(config['save_dir'], 'training_summary.json')
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    return model
 
-    # Plot training curves
-    plt.figure(figsize=(12, 4))
-    plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label='Training Loss')
-    plt.plot(val_losses, label='Validation Loss')
+
+def save_training_curves(train_losses, val_losses, save_dir):
+    """Save training curves"""
+    plt.figure(figsize=(15, 5))
+    
+    # Loss curves
+    plt.subplot(1, 3, 1)
+    plt.plot(train_losses, label='Train Loss', color='blue', linewidth=2)
+    plt.plot(val_losses, label='Val Loss', color='red', linewidth=2)
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.title('Training and Validation Loss')
     plt.legend()
-    plt.grid(True)
+    plt.grid(True, alpha=0.3)
     
-    plt.subplot(1, 2, 2)
-    plt.plot(train_losses, label='Training Loss')
+    # Log scale loss
+    plt.subplot(1, 3, 2)
+    plt.plot(train_losses, label='Train Loss', color='blue', linewidth=2)
+    plt.plot(val_losses, label='Val Loss', color='red', linewidth=2)
     plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training Loss')
+    plt.ylabel('Loss (log scale)')
+    plt.title('Training Loss (Log Scale)')
+    plt.yscale('log')
     plt.legend()
-    plt.grid(True)
+    plt.grid(True, alpha=0.3)
+    
+    # Overfitting detection
+    plt.subplot(1, 3, 3)
+    if len(train_losses) > 1:
+        overfitting_gap = [val - train for train, val in zip(train_losses, val_losses)]
+        plt.plot(overfitting_gap, label='Val-Train Gap', color='purple', linewidth=2)
+        plt.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+        plt.xlabel('Epoch')
+        plt.ylabel('Validation - Training Loss')
+        plt.title('Overfitting Detection')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(os.path.join(config['save_dir'], 'training_curves.png'))
-    plt.show()
-
-    print("Training completed!")
-    print(f"Final model saved: {final_model_path}")
-    return model
+    plot_path = os.path.join(save_dir, 'training_curves.png')
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"   Training curves saved to: {plot_path}")
 
 
-def generate_pseudo_labels_with_maskrcnn(model_path, unlabeled_images_dir, output_dir, 
-                                       confidence_threshold=0.7, nms_threshold=0.5):
-    """Generate pseudo labels using trained Mask R-CNN model."""
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    # Load model
-    model = get_instance_model(28)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.to(device)
-    model.eval() 
-
-    # Class mapping for pseudo labels
-    class_map = {
-        1: {'plant': 'apple', 'ripeness': 'ripe'},
-        2: {'plant': 'apple', 'ripeness': 'unripe'},
-        3: {'plant': 'apple', 'ripeness': 'spoiled'},
-        4: {'plant': 'cherry', 'ripeness': 'ripe'},
-        5: {'plant': 'cherry', 'ripeness': 'unripe'},
-        6: {'plant': 'cherry', 'ripeness': 'spoiled'},
-        7: {'plant': 'cucumber', 'ripeness': 'ripe'},
-        8: {'plant': 'cucumber', 'ripeness': 'unripe'},
-        9: {'plant': 'cucumber', 'ripeness': 'spoiled'},
-        10: {'plant': 'lettuce', 'ripeness': 'ripe'},
-        11: {'plant': 'lettuce', 'ripeness': 'unripe'},
-        12: {'plant': 'lettuce', 'ripeness': 'spoiled'},
-        13: {'plant': 'pear', 'ripeness': 'ripe'},
-        14: {'plant': 'pear', 'ripeness': 'unripe'},
-        15: {'plant': 'pear', 'ripeness': 'spoiled'},
-        16: {'plant': 'pepper', 'ripeness': 'ripe'},
-        17: {'plant': 'pepper', 'ripeness': 'unripe'},
-        18: {'plant': 'pepper', 'ripeness': 'spoiled'},
-        19: {'plant': 'raspberry', 'ripeness': 'ripe'},
-        20: {'plant': 'raspberry', 'ripeness': 'unripe'},
-        21: {'plant': 'raspberry', 'ripeness': 'spoiled'},
-        22: {'plant': 'strawberry', 'ripeness': 'ripe'},
-        23: {'plant': 'strawberry', 'ripeness': 'unripe'},
-        24: {'plant': 'strawberry', 'ripeness': 'spoiled'},
-        25: {'plant': 'tomato', 'ripeness': 'ripe'},
-        26: {'plant': 'tomato', 'ripeness': 'unripe'},
-        27: {'plant': 'tomato', 'ripeness': 'spoiled'},
-    }
-
-    # Image preprocessing
-    transform = transforms.Compose([
-        transforms.Resize((1200, 1200)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                           std=[0.229, 0.224, 0.225])
-    ])
-
-    # Setup output directories
-    os.makedirs(output_dir, exist_ok=True)
-    pseudo_masks_dir = os.path.join(output_dir, 'pseudo_masks')
-    pseudo_annotations_dir = os.path.join(output_dir, 'pseudo_annotations')
-    os.makedirs(pseudo_masks_dir, exist_ok=True)
-    os.makedirs(pseudo_annotations_dir, exist_ok=True)
-
-    processed_count = 0
-    total_instances = 0
-    negative_images = 0
-
-    print("Generating pseudo labels...")
-
-    for root, _, files in os.walk(unlabeled_images_dir):
-        for filename in files:
-            if not filename.lower().endswith(('.png', '.jpg', '.jpeg')):
-                continue
-
-            image_path = os.path.join(root, filename)
-
-            try:
-                image = Image.open(image_path).convert('RGB')
-                original_size = image.size
-
-                with torch.no_grad():
-                    image_tensor = transform(image).unsqueeze(0).to(device)
-                    predictions = model(image_tensor)
-
-                pred = predictions[0]
-                keep_idx = pred['scores'] > confidence_threshold
-
-                if torch.sum(keep_idx) == 0:
-                    # This is a negative image (no detections above threshold)
-                    negative_images += 1
-                    
-                    # Still create an annotation file for consistency
-                    base_name = os.path.splitext(filename)[0]
-                    pseudo_annotation = {
-                        filename: {
-                            'filename': filename,
-                            'size': os.path.getsize(image_path),
-                            'regions': [],  # Empty regions for negative sample
-                            'file_attributes': {
-                                'plant': 'background'  # Mark as background image
-                            }
-                        }
-                    }
-                    
-                    annotation_path = os.path.join(pseudo_annotations_dir, f"{base_name}_negative.json")
-                    with open(annotation_path, 'w') as f:
-                        json.dump(pseudo_annotation, f, indent=2)
-                    
-                    processed_count += 1
-                    print(f"Generated negative sample annotation for {filename}")
-                    continue
-
-                # Apply NMS for positive detections
-                keep_idx = torch.ops.torchvision.nms(
-                    pred['boxes'][keep_idx], 
-                    pred['scores'][keep_idx], 
-                    nms_threshold
-                )
-
-                boxes = pred['boxes'][keep_idx]
-                labels = pred['labels'][keep_idx]
-                masks = pred['masks'][keep_idx]
-                scores = pred['scores'][keep_idx]
-
-                if len(boxes) == 0:
-                    negative_images += 1
-                    continue
-
-                base_name = os.path.splitext(filename)[0]
-                regions = []
-
-                height, width = original_size[1], original_size[0]
-                instance_mask = np.zeros((height, width), dtype=np.uint16)
-                semantic_mask = np.zeros((height, width), dtype=np.uint8)
-
-                for i, (box, label, mask, score) in enumerate(zip(boxes, labels, masks, scores)):
-                    mask_np = mask[0].cpu().numpy()
-                    mask_resized = cv2.resize(mask_np, (width, height), 
-                                            interpolation=cv2.INTER_LINEAR)
-                    mask_binary = mask_resized > 0.5
-
-                    if np.sum(mask_binary) < 100:
-                        continue
-
-                    contours, _ = cv2.findContours(
-                        mask_binary.astype(np.uint8), 
-                        cv2.RETR_EXTERNAL, 
-                        cv2.CHAIN_APPROX_SIMPLE
-                    )
-
-                    if len(contours) == 0:
-                        continue
-
-                    largest_contour = max(contours, key=cv2.contourArea)
-                    epsilon = 0.01 * cv2.arcLength(largest_contour, True)
-                    simplified = cv2.approxPolyDP(largest_contour, epsilon, True)
-
-                    if len(simplified) < 3:
-                        continue
-
-                    x_points = [int(point[0][0]) for point in simplified]
-                    y_points = [int(point[0][1]) for point in simplified]
-
-                    class_id = label.item()
-                    
-                    if class_id in class_map:
-                        plant_type = class_map[class_id]['plant']
-                        ripeness = class_map[class_id]['ripeness']
-                    else:
-                        continue
-
-                    region = {
-                        'shape_attributes': {
-                            'name': 'polygon',
-                            'all_points_x': x_points,
-                            'all_points_y': y_points
-                        },
-                        'region_attributes': {
-                            'ripeness_factor': ripeness
-                        }
-                    }
-
-                    regions.append(region)
-                    instance_mask[mask_binary] = i + 1
-                    semantic_mask[mask_binary] = class_id
-                    total_instances += 1
-
-                if len(regions) > 0:
-                    pseudo_annotation = {
-                        filename: {
-                            'filename': filename,
-                            'size': os.path.getsize(image_path),
-                            'regions': regions,
-                            'file_attributes': {
-                                'plant': class_map[labels[0].item()]['plant']
-                            }
-                        }
-                    }
-                    annotation_path = os.path.join(pseudo_annotations_dir, f"{base_name}_pseudo.json")
-
-                    with open(annotation_path, 'w') as f:
-                        json.dump(pseudo_annotation, f, indent=2)
-
-                    mask_dir = os.path.join(pseudo_masks_dir, class_map[labels[0].item()]['plant'])
-                    os.makedirs(mask_dir, exist_ok=True)
-                    
-                    Image.fromarray(semantic_mask).save(
-                        os.path.join(mask_dir, f"{base_name}_semantic.png")
-                    )
-                    Image.fromarray(instance_mask).save(
-                        os.path.join(mask_dir, f"{base_name}_instance.png")
-                    )
-
-                processed_count += 1
-                print(f"Generated pseudo labels for {filename}: {len(regions)} instances")
-                
-            except Exception as e:
-                print(f"Error processing {filename}: {e}")
-                continue
-
-    print(f"\nPseudo Label Generation Summary:")
-    print(f"Processed: {processed_count} images")
-    print(f"Positive images (with detections): {processed_count - negative_images}")
-    print(f"Negative images (background only): {negative_images}")
-    print(f"Total pseudo instances: {total_instances}")
-    print(f"Average instances per positive image: {total_instances/(processed_count - negative_images):.1f}" if processed_count - negative_images > 0 else 0)
-
-    return processed_count, total_instances
-
-
-def visualize_predictions(model_path, test_image_path, save_path=None):
-    """
-    Visualize predictions from a trained Mask R-CNN model on a test image.
+def test_model(model_path, test_image_path, device='cuda', confidence_threshold=0.5):
+    """Test the trained model on a single image"""
+    print("\nTesting model on image...")
     
-    Args:
-        model_path: Path to the trained model weights
-        test_image_path: Path to the test image
-        save_path: Optional path to save the visualization
-    """
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    # Load the trained model
-    model = get_instance_model(28)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    # Load model
+    model = get_model(num_classes=16, dropout_rate=0.0)  # No dropout for inference
+    
+    # Load checkpoint or state dict
+    checkpoint = torch.load(model_path, map_location=device)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Loaded model from epoch {checkpoint.get('epoch', 'unknown')}")
+    else:
+        model.load_state_dict(checkpoint)
+    
     model.to(device)
     model.eval()
-
-    # Load and preprocess the image
-    image = Image.open(test_image_path).convert('RGB')
-    original_image = np.array(image)
-
+    
+    # Load and preprocess image
+    image = cv2.imread(test_image_path)
+    if image is None:
+        print(f"Error: Could not load image {test_image_path}")
+        return None
+    
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    original_image = image.copy()
+    
     transform = transforms.Compose([
-        transforms.Resize((1200, 1200)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                           std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    # Make predictions
+    image_tensor = transform(Image.fromarray(image))
+    
+    # Make prediction
     with torch.no_grad():
-        image_tensor = transform(image).unsqueeze(0).to(device)
-        predictions = model(image_tensor)
-
-    pred = predictions[0]
-    confidence_threshold = 0.5
-
+        prediction = model([image_tensor.to(device)])[0]
+    
     # Filter predictions by confidence
-    keep = pred['scores'] > confidence_threshold
-    boxes = pred['boxes'][keep].cpu().numpy()
-    labels = pred['labels'][keep].cpu().numpy()
-    masks = pred['masks'][keep].cpu().numpy()
-    scores = pred['scores'][keep].cpu().numpy()
+    keep = prediction['scores'] > confidence_threshold
     
-    # Class names mapping
-    class_names = ['background']
-    class_map = {
-        'apple': {'ripe': 1, 'unripe': 2, 'spoiled': 3},
-        'cherry': {'ripe': 4, 'unripe': 5, 'spoiled': 6},
-        'cucumber': {'ripe': 7, 'unripe': 8, 'spoiled': 9},
-        'lettuce': {'ripe': 10, 'unripe': 11, 'spoiled': 12},
-        'pear': {'ripe': 13, 'unripe': 14, 'spoiled': 15},
-        'pepper': {'ripe': 16, 'unripe': 17, 'spoiled': 18},
-        'raspberry': {'ripe': 19, 'unripe': 20, 'spoiled': 21},
-        'strawberry': {'ripe': 22, 'unripe': 23, 'spoiled': 24},
-        'tomato': {'ripe': 25, 'unripe': 26, 'spoiled': 27},
-    }
+    boxes = prediction['boxes'][keep].cpu()
+    labels = prediction['labels'][keep].cpu()
+    scores = prediction['scores'][keep].cpu()
+    masks = prediction['masks'][keep].cpu()
     
-    for plant, ripeness_dict in class_map.items():
-        for ripeness, class_id in ripeness_dict.items():
-            class_names.append(f"{plant}-{ripeness}")
+    print(f"Detected {len(boxes)} objects with confidence > {confidence_threshold}")
     
-    # Create visualization
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-
+    # Visualize results
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    
     # Original image
-    resized_original = cv2.resize(original_image, (1200, 1200))
-    axes[0].imshow(resized_original)
+    axes[0].imshow(original_image)
     axes[0].set_title('Original Image')
     axes[0].axis('off')
-
-    # Image with bounding boxes and labels
-    image_with_boxes = resized_original.copy()
     
-    for box, label, score in zip(boxes, labels, scores):
-        x1, y1, x2, y2 = box.astype(int)
+    # Detection results
+    axes[1].imshow(original_image)
+    
+    # Class names mapping
+    class_names = ['background',
+                   'apple-ripe', 'apple-unripe', 'apple-spoiled',
+                   'cherry-ripe', 'cherry-unripe', 'cherry-spoiled',
+                   'cucumber-ripe', 'cucumber-unripe', 'cucumber-spoiled',
+                   'strawberry-ripe', 'strawberry-unripe', 'strawberry-spoiled',
+                   'tomato-ripe', 'tomato-unripe', 'tomato-spoiled']
+    
+    # Color map for different fruits
+    fruit_colors = {
+        'apple': 'red', 'cherry': 'darkred', 'cucumber': 'green',
+        'strawberry': 'pink', 'tomato': 'orange'
+    }
+    
+    # Draw predictions
+    for i in range(len(boxes)):
+        box = boxes[i]
+        label = labels[i].item()
+        score = scores[i].item()
+        mask = masks[i, 0].numpy()
+        
+        # Get fruit type for color
+        class_name = class_names[label]
+        fruit_type = class_name.split('-')[0]
+        color = fruit_colors.get(fruit_type, 'blue')
         
         # Draw bounding box
-        cv2.rectangle(image_with_boxes, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        x1, y1, x2, y2 = box
+        rect = plt.Rectangle((x1, y1), x2-x1, y2-y1, 
+                           fill=False, edgecolor=color, linewidth=2)
+        axes[1].add_patch(rect)
         
-        # Add label and confidence
-        if label < len(class_names):
-            label_text = f'{class_names[label]}: {score:.2f}'
-        else:
-            label_text = f'Class {label}: {score:.2f}'
-            
-        cv2.putText(image_with_boxes, label_text, 
-                   (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+        # Apply mask overlay
+        masked = np.ma.masked_where(mask < 0.5, mask)
+        axes[1].imshow(masked, alpha=0.3, cmap=plt.cm.colors.ListedColormap([color]))
         
-    axes[1].imshow(image_with_boxes)
-    axes[1].set_title(f'Predictions (conf > {confidence_threshold})')
+        # Add label
+        label_text = f"{class_name}: {score:.2f}"
+        axes[1].text(x1, y1-5, label_text, 
+                    bbox=dict(facecolor=color, alpha=0.7),
+                    fontsize=10, color='white', weight='bold')
+    
+    axes[1].set_title(f'Detections (threshold={confidence_threshold})')
     axes[1].axis('off')
-
-    # Combined instance masks
-    combined_mask = np.zeros((1200, 1200, 3))
-    colors = plt.cm.Set3(np.linspace(0, 1, max(len(masks), 1)))
-
-    for i, (mask, color) in enumerate(zip(masks, colors)):
-        mask_resized = cv2.resize(mask[0], (1200, 1200))
-        mask_binary = mask_resized > 0.5
-        combined_mask[mask_binary] = color[:3]
-
-    axes[2].imshow(combined_mask)
-    axes[2].set_title('Instance Masks')
-    axes[2].axis('off')
-
+    
     plt.tight_layout()
     
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    # Save result
+    result_path = test_image_path.replace('.', '_result.')
+    plt.savefig(result_path, dpi=150, bbox_inches='tight')
+    print(f"Result saved to: {result_path}")
+    
     plt.show()
     
-    # Print detection summary
-    print(f"Detected {len(boxes)} instances")
-    for i, (label, score) in enumerate(zip(labels, scores)):
-        if label < len(class_names):
-            label_name = class_names[label]
-        else:
-            label_name = f"Class {label}"
-        print(f"Instance {i+1}: {label_name}, Confidence {score:.3f}")
-
-    return boxes, labels, masks, scores
+    return prediction
 
 
-def batch_predict_and_visualize(model_path, image_dir, output_dir, confidence_threshold=0.5):
-    """
-    Run predictions on all images in a directory and save visualizations.
+def analyze_model_performance(model_path, val_loader, device='cuda', num_samples=50):
+    """Analyze model performance on validation set"""
+    print("\nAnalyzing model performance...")
     
-    Args:
-        model_path: Path to trained model
-        image_dir: Directory containing test images
-        output_dir: Directory to save prediction visualizations
-        confidence_threshold: Minimum confidence for detections
-    """
-    os.makedirs(output_dir, exist_ok=True)
+    # Load model
+    model = get_model(num_classes=16, dropout_rate=0.0)
+    checkpoint = torch.load(model_path, map_location=device)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
     
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = get_instance_model(28)
-    model.load_state_dict(torch.load(model_path, map_location=device))
     model.to(device)
     model.eval()
     
-    image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff')
-    processed = 0
-    
-    for filename in os.listdir(image_dir):
-        if not filename.lower().endswith(image_extensions):
-            continue
-            
-        image_path = os.path.join(image_dir, filename)
-        output_path = os.path.join(output_dir, f"pred_{filename}")
-        
-        try:
-            visualize_predictions(model_path, image_path, output_path)
-            processed += 1
-            print(f"Processed: {filename}")
-        except Exception as e:
-            print(f"Error processing {filename}: {e}")
-    
-    print(f"\nBatch prediction complete. Processed {processed} images.")
-    print(f"Results saved to: {output_dir}")
-
-
-def evaluate_model_performance(model_path, val_dataset, device='cuda'):
-    """
-    Evaluate model performance on validation dataset.
-    
-    Args:
-        model_path: Path to trained model
-        val_dataset: Validation dataset
-        device: Device to run evaluation on
-    """
-    model = get_instance_model(28)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.to(device)
-    model.eval()
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=1,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=2
-    )
-    
-    total_detections = 0
-    total_ground_truth = 0
-    confidence_threshold = 0.5
+    # Collect predictions
+    all_predictions = []
+    all_targets = []
     
     with torch.no_grad():
-        for images, targets in val_loader:
-            if images is None or targets is None:
+        for idx, (images, targets) in enumerate(val_loader):
+            if idx >= num_samples:
+                break
+            
+            if images is None:
                 continue
-                
-            images = [img.to(device) for img in images]
-            predictions = model(images)
             
-            for pred, target in zip(predictions, targets):
-                # Count predictions above threshold
-                keep = pred['scores'] > confidence_threshold
-                total_detections += torch.sum(keep).item()
+            try:
+                images = list(img.to(device) for img in images)
+                predictions = model(images)
                 
-                # Count ground truth objects
-                total_ground_truth += len(target['labels'])
-    
-    print(f"Evaluation Results:")
-    print(f"Total Ground Truth Objects: {total_ground_truth}")
-    print(f"Total Detections (conf > {confidence_threshold}): {total_detections}")
-    print(f"Detection Rate: {total_detections/total_ground_truth:.3f}" if total_ground_truth > 0 else "N/A")
+                all_predictions.extend(predictions)
+                all_targets.extend(targets)
+                
+            except Exception as e:
+                continue
 
-
-def get_class_statistics(dataset):
-    """
-    Get statistics about class distribution in dataset.
-    
-    Args:
-        dataset: FruitInstanceDataset object
-    """
     class_counts = {}
-    total_instances = 0
-    positive_images = 0
-    negative_images = 0
+    confidence_scores = []
     
-    for i in range(len(dataset)):
-        try:
-            _, target = dataset[i]
-            
-            if target['is_negative']:
-                negative_images += 1
-            else:
-                positive_images += 1
-                
-            labels = target['labels']
-            total_instances += len(labels)
-            
-            for label in labels:
-                label_item = label.item()
-                if label_item in class_counts:
-                    class_counts[label_item] += 1
-                else:
-                    class_counts[label_item] = 1
-                    
-        except Exception as e:
-            print(f"Error processing sample {i}: {e}")
-            continue
+    for pred, target in zip(all_predictions, all_targets):
+        # Get predictions above threshold
+        keep = pred['scores'] > 0.5
+        labels = pred['labels'][keep].cpu().numpy()
+        scores = pred['scores'][keep].cpu().numpy()
+        
+        for label, score in zip(labels, scores):
+            if label not in class_counts:
+                class_counts[label] = 0
+            class_counts[label] += 1
+            confidence_scores.append(score)
     
-    print(f"Dataset Statistics:")
-    print(f"Positive images (with annotations): {positive_images}")
-    print(f"Negative images (background only): {negative_images}")
-    print(f"Total instances: {total_instances}")
-    print(f"Average instances per positive image: {total_instances/positive_images:.2f}" if positive_images > 0 else "N/A")
+    # Analysis results
+    print("\nDetection Statistics:")
+    print(f"Total detections: {len(confidence_scores)}")
+    print(f"Average confidence: {np.mean(confidence_scores):.3f}")
+    print(f"Confidence range: [{np.min(confidence_scores):.3f}, {np.max(confidence_scores):.3f}]")
     
-    print(f"\nClass Distribution:")
+    print("\nDetections per class:")
+    class_names = ['background',
+                   'apple-ripe', 'apple-unripe', 'apple-spoiled',
+                   'cherry-ripe', 'cherry-unripe', 'cherry-spoiled',
+                   'cucumber-ripe', 'cucumber-unripe', 'cucumber-spoiled',
+                   'strawberry-ripe', 'strawberry-unripe', 'strawberry-spoiled',
+                   'tomato-ripe', 'tomato-unripe', 'tomato-spoiled']
+    
     for class_id, count in sorted(class_counts.items()):
-        if class_id < len(dataset.class_names):
-            class_name = dataset.class_names[class_id]
-        else:
-            class_name = f"Class {class_id}"
-        print(f"  {class_name}: {count} instances")
+        if class_id < len(class_names):
+            print(f"  {class_names[class_id]}: {count}")
+    
+    return all_predictions, all_targets
 
 
 def main():
-    """Main execution pipeline."""
-    print("=== FRUIT INSTANCE SEGMENTATION TRAINING PIPELINE ===")
+    """Main execution function"""
+    config = {
+        'images_dir': 'RePictures/',
+        'masks_dir': 'ReInstanceMasks/',
+        'save_dir': 'fruit_detection_model_enhanced',
+        'use_augmented_dataset': True,  # Use augmented dataset from MakeMaskInstanceSemanticDataset.py
+        
+        # Model parameters
+        'num_classes': 16,  # 1 background + 15 fruit-ripeness combinations
+        'dropout_rate': 0.3,  # Dropout for regularization
+        
+        # Training parameters
+        'batch_size': 2,
+        'learning_rate': 0.002,
+        'num_epochs': 100,
+        'weight_decay': 0.0005,
+        'gradient_clip': 10.0,
+        
+        # Learning rate schedule
+        'lr_step_size': 20,
+        'lr_gamma': 0.5,
+        'warmup_epochs': 5,
+        
+        # Early stopping
+        'early_stopping_patience': 15,
+        'early_stopping_delta': 0.0001,
+        
+        # Data augmentation
+        'augmentation': {
+            'brightness': 0.3,
+            'contrast': 0.3,
+            'saturation': 0.3,
+            'hue': 0.1
+        },
+        
+        # System
+        'num_workers': 4,
+        'print_freq': 10,
+        'checkpoint_freq': 5,
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+    }
     
-    # Step 1: Training
-    print("\n1. Training Instance Segmentation Model...")
-    try:
-        trained_model = train_instance_model()
-        print("✓ Training completed successfully")
-    except Exception as e:
-        print(f"✗ Training failed: {e}")
+    # Check if directories exist
+    if not os.path.exists(config['images_dir']):
+        print(f"Error: Images directory '{config['images_dir']}' not found!")
         return
-
-    # Step 2: Pseudo Label Generation
-    print("\n2. Generating Pseudo Labels...")
-    model_path = "instance_checkpoints/final_model.pth"
-    unlabeled_dir = "unlabeled_images/" 
-    pseudo_output_dir = "pseudo_labels/"
     
-    if os.path.exists(model_path) and os.path.exists(unlabeled_dir):
-        try:
-            processed, total = generate_pseudo_labels_with_maskrcnn(
-                model_path, unlabeled_dir, pseudo_output_dir, 
-                confidence_threshold=0.7
-            )
-            print(f"✓ Generated pseudo labels for {processed} images with {total} instances")
-        except Exception as e:
-            print(f"✗ Pseudo label generation failed: {e}")
-    else:
-        print("⚠ Skipping pseudo label generation - model or unlabeled images not found")
-
-    # Step 3: Test Prediction Visualization
-    print("\n3. Test Prediction Visualization...")
-    test_image = "Pictures/Cherry/CA-cherries-split2.jpg"
+    if not os.path.exists(config['masks_dir']):
+        print(f"Error: Masks directory '{config['masks_dir']}' not found!")
+        return
     
-    if os.path.exists(model_path) and os.path.exists(test_image):
-        try:
-            visualize_predictions(model_path, test_image, "prediction_visualization.png")
-            print("✓ Visualization completed")
-        except Exception as e:
-            print(f"✗ Visualization failed: {e}")
-    else:
-        print("⚠ Skipping visualization - model or test image not found")
+    # Check for resume
+    resume_checkpoint = None
+    if os.path.exists(config['save_dir']):
+        checkpointer = ModelCheckpointer(config['save_dir'])
+        latest_checkpoint = checkpointer.find_latest_checkpoint()
+        
+        if latest_checkpoint:
+            print(f"\nFound existing checkpoint: {latest_checkpoint}")
+            resume = input("Resume from this checkpoint? (y/n): ").lower().strip()
+            if resume == 'y':
+                resume_checkpoint = latest_checkpoint
     
-    # Step 4: Dataset Statistics (Optional)
-    print("\n4. Dataset Analysis...")
+    # Train the model
     try:
-        transform = transforms.Compose([
-            transforms.Resize((1200, 1200)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                               std=[0.229, 0.224, 0.225])
-        ])
+        model = train_model(config, resume_from=resume_checkpoint)
+        print("\n Training completed successfully!")
         
-        dataset = FruitInstanceDataset(
-            json_file="via_export_json(4).json",
-            images_dir="Pictures/",
-            transform=transform,
-            include_negatives=True
-        )
+        test_images = []
+        search_dir = 'AugmentedDataset/images/' if config['use_augmented_dataset'] else config['images_dir']
         
-        get_class_statistics(dataset)
-        print("✓ Dataset analysis completed")
+        for root, dirs, files in os.walk(search_dir):
+            for file in files:
+                if file.lower().endswith(('.jpg', '.jpeg', '.png')) and 'original' in file:
+                    test_images.append(os.path.join(root, file))
+                    if len(test_images) >= 5:
+                        break
+        
+        if test_images:
+            print(f"\nTesting on {len(test_images)} sample images...")
+            model_path = os.path.join(config['save_dir'], 'best_model.pth')
+            
+            for test_img in test_images[:3]:
+                print(f"\nTesting: {os.path.basename(test_img)}")
+                test_model(model_path, test_img, config['device'])
+                
+    except KeyboardInterrupt:
+        print("\n Training interrupted by user")
+        print("You can resume training by running the script again")
     except Exception as e:
-        print(f"✗ Dataset analysis failed: {e}")
-    
-    print("\n=== PIPELINE COMPLETE ===")
-
+        print(f"\n Training failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
