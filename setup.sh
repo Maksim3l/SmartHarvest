@@ -1,6 +1,6 @@
 echo "Setting up the environment for the model..."
 python -m venv model_env
-source model_env/Scripts/activate
+source model_env/bin/activate
 
 echo "Installing required packages..."
 pip install -r model_requirements.txt

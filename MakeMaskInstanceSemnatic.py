@@ -1,20 +1,27 @@
 import json
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 import os
 from pathlib import Path
+import random
+import cv2
+from scipy import ndimage
 
-def create_instance_masks_from_json(json_file_path, images_dir, output_dir):
+def create_instance_masks_from_json(json_file_path, images_dir, output_dir, skip_classes=None):
     """
     Convert VIA JSON annotations to instance masks preserving individual fruit instances.
     Each instance gets a unique ID while maintaining class information.
     """
+    if skip_classes is None:
+        skip_classes = []
+    
+    skip_classes = [cls.lower() for cls in skip_classes]
+    
     with open(json_file_path, 'r') as f:
         annotations = json.load(f)
     
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Create output subdirectories
+
     semantic_dir = os.path.join(output_dir, 'semantic_masks')
     instance_dir = os.path.join(output_dir, 'instance_masks')
     panoptic_dir = os.path.join(output_dir, 'panoptic_masks')
@@ -22,7 +29,6 @@ def create_instance_masks_from_json(json_file_path, images_dir, output_dir):
     os.makedirs(instance_dir, exist_ok=True)
     os.makedirs(panoptic_dir, exist_ok=True)
 
-    # Class mapping for semantic segmentation
     class_map = {
         'apple': {'ripe': 1, 'unripe': 2, 'spoiled': 3},
         'cherry': {'ripe': 4, 'unripe': 5, 'spoiled': 6},
@@ -45,9 +51,9 @@ def create_instance_masks_from_json(json_file_path, images_dir, output_dir):
         return None
 
     processed_count = 0
+    skipped_count = 0
     total_instances = 0
     
-    # Global instance ID counter (across all images)
     global_instance_id = 1
 
     for image_data in annotations.values():
@@ -57,6 +63,11 @@ def create_instance_masks_from_json(json_file_path, images_dir, output_dir):
         filename = image_data['filename']
         plant_type = image_data.get('file_attributes', {}).get('plant', 'unknown').lower()
         regions = image_data.get('regions', [])
+
+        if plant_type in skip_classes:
+            print(f"SKIPPING {filename} ({plant_type}) - class in skip list")
+            skipped_count += 1
+            continue
 
         print(f"Processing {filename} ({plant_type}) with {len(regions)} regions")
         
@@ -72,7 +83,6 @@ def create_instance_masks_from_json(json_file_path, images_dir, output_dir):
             print(f"Error opening {filename}: {e}")
             continue
 
-        # Create plant-specific output directories
         plant_semantic_dir = os.path.join(semantic_dir, plant_type)
         plant_instance_dir = os.path.join(instance_dir, plant_type)
         plant_panoptic_dir = os.path.join(panoptic_dir, plant_type)
@@ -80,12 +90,10 @@ def create_instance_masks_from_json(json_file_path, images_dir, output_dir):
         for dir_path in [plant_semantic_dir, plant_instance_dir, plant_panoptic_dir]:
             os.makedirs(dir_path, exist_ok=True)
 
-        # Initialize masks
         semantic_mask = np.zeros((height, width), dtype=np.uint8)
-        instance_mask = np.zeros((height, width), dtype=np.uint16)  # uint16 for more instances
-        panoptic_mask = np.zeros((height, width), dtype=np.uint32)  # Combines class + instance
-        
-        # Store instance information for this image
+        instance_mask = np.zeros((height, width), dtype=np.uint16)
+        panoptic_mask = np.zeros((height, width), dtype=np.uint32)
+
         instances_info = []
         image_instance_count = 0
 
@@ -107,70 +115,55 @@ def create_instance_masks_from_json(json_file_path, images_dir, output_dir):
                 
             polygon_coords = list(zip(x_points, y_points))
             ripeness = region_attrs.get('ripeness_factor', 'ripe')
-            
-            # Get semantic class ID
+
             if plant_type in class_map and ripeness in class_map[plant_type]:
                 semantic_class_id = class_map[plant_type][ripeness]
             else:
-                semantic_class_id = 28  # Obscured/unknown
-            
-            # Create temporary mask for this instance
+                semantic_class_id = 28
+
             temp_img = Image.new('L', (width, height), 0)
             ImageDraw.Draw(temp_img).polygon(polygon_coords, fill=255)
             instance_pixels = np.array(temp_img) > 0
             
-            if np.sum(instance_pixels) < 10:  # Skip very small instances
+            if np.sum(instance_pixels) < 10:
                 continue
-            
-            # Assign IDs to masks
+
             semantic_mask[instance_pixels] = semantic_class_id
             instance_mask[instance_pixels] = global_instance_id
             
-            # Panoptic mask: combine semantic class and instance ID
-            # Format: (semantic_class_id * 1000) + instance_id
             panoptic_id = semantic_class_id * 1000 + global_instance_id
             panoptic_mask[instance_pixels] = panoptic_id
-            
-            # Get bbox and convert to Python ints
+
             bbox = get_bbox_from_mask(instance_pixels)
             
-            # Store instance information - Convert numpy types to Python types
             instances_info.append({
                 'instance_id': int(global_instance_id),
                 'semantic_class_id': int(semantic_class_id),
                 'plant_type': plant_type,
                 'ripeness': ripeness,
-                'area': int(np.sum(instance_pixels)),  # Convert numpy int64 to Python int
-                'bbox': [int(x) for x in bbox]  # Convert all bbox values to Python ints
+                'area': int(np.sum(instance_pixels)),  
+                'bbox': [int(x) for x in bbox]
             })
             
             global_instance_id += 1
             image_instance_count += 1
             total_instances += 1
 
-        # Save masks
         base_filename = Path(filename).stem
-        
-        # Semantic mask
         semantic_path = os.path.join(plant_semantic_dir, f"{base_filename}_semantic.png")
         Image.fromarray(semantic_mask).save(semantic_path)
-        
-        # Instance mask
         instance_path = os.path.join(plant_instance_dir, f"{base_filename}_instance.png")
         Image.fromarray(instance_mask).save(instance_path)
-        
-        # Panoptic mask
         panoptic_path = os.path.join(plant_panoptic_dir, f"{base_filename}_panoptic.png")
         Image.fromarray(panoptic_mask).save(panoptic_path)
-        
-        # Save instance information as JSON
+
         info_path = os.path.join(plant_instance_dir, f"{base_filename}_instances.json")
         with open(info_path, 'w') as f:
             json.dump({
                 'filename': filename,
                 'plant_type': plant_type,
-                'image_size': [int(width), int(height)],  # Convert to Python ints
-                'num_instances': int(image_instance_count),  # Convert to Python int
+                'image_size': [int(width), int(height)], 
+                'num_instances': int(image_instance_count),  
                 'instances': instances_info
             }, f, indent=2)
 
@@ -179,10 +172,13 @@ def create_instance_masks_from_json(json_file_path, images_dir, output_dir):
 
     print(f"\nInstance Mask Generation Summary:")
     print(f"Processed: {processed_count} images")
+    print(f"Skipped: {skipped_count} images ({skip_classes})")
     print(f"Total instances: {total_instances} individual fruits/vegetables")
-    print(f"Average instances per image: {total_instances/processed_count:.1f}")
+    if processed_count > 0:
+        print(f"Average instances per image: {total_instances/processed_count:.1f}")
     
     return processed_count, total_instances
+
 
 def get_bbox_from_mask(mask):
     """Get bounding box coordinates from binary mask"""
@@ -391,6 +387,400 @@ def smart_resize_instance_masks(original_images_dir, instance_masks_dir,
     print(f"\nSmart resizing complete! Processed {processed} image/mask sets")
     print("All images and masks maintain aspect ratio with center crop/padding as needed")
 
+def augment_image_and_masks(image, semantic_mask, instance_mask, augmentation_params):
+    """
+    Apply augmentations to image and corresponding masks.
+    Returns augmented image, semantic mask, and instance mask.
+    """
+    # Convert PIL images to numpy arrays for processing
+    img_array = np.array(image)
+    semantic_array = np.array(semantic_mask)
+    instance_array = np.array(instance_mask)
+    
+    # Store original dtypes
+    semantic_dtype = semantic_array.dtype
+    instance_dtype = instance_array.dtype
+    
+    # Random selection of augmentations
+    augmentations_applied = []
+    
+    # 1. Rotation (always apply with some probability)
+    if random.random() < augmentation_params.get('rotation_prob', 0.5):
+        angle = random.uniform(
+            augmentation_params.get('rotation_min', -15),
+            augmentation_params.get('rotation_max', 15)
+        )
+        img_array = ndimage.rotate(img_array, angle, reshape=False, order=1)
+        semantic_array = ndimage.rotate(semantic_array, angle, reshape=False, order=0)
+        instance_array = ndimage.rotate(instance_array, angle, reshape=False, order=0)
+        augmentations_applied.append(f"rotation_{angle:.1f}")
+    
+    # 2. Horizontal Flip
+    if random.random() < augmentation_params.get('flip_prob', 0.5):
+        img_array = np.fliplr(img_array)
+        semantic_array = np.fliplr(semantic_array)
+        instance_array = np.fliplr(instance_array)
+        augmentations_applied.append("h_flip")
+    
+    # 3. Scaling/Zoom
+    if random.random() < augmentation_params.get('scale_prob', 0.5):
+        scale = random.uniform(
+            augmentation_params.get('scale_min', 0.8),
+            augmentation_params.get('scale_max', 1.2)
+        )
+        h, w = img_array.shape[:2]
+        new_h, new_w = int(h * scale), int(w * scale)
+        
+        # Resize
+        img_array = cv2.resize(img_array, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        semantic_array = cv2.resize(semantic_array, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+        instance_array = cv2.resize(instance_array, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+        
+        # Crop or pad to original size
+        if scale > 1:
+            # Crop center
+            start_h = (new_h - h) // 2
+            start_w = (new_w - w) // 2
+            img_array = img_array[start_h:start_h+h, start_w:start_w+w]
+            semantic_array = semantic_array[start_h:start_h+h, start_w:start_w+w]
+            instance_array = instance_array[start_h:start_h+h, start_w:start_w+w]
+        else:
+            # Pad
+            pad_h = (h - new_h) // 2
+            pad_w = (w - new_w) // 2
+            img_array = np.pad(img_array, ((pad_h, h-new_h-pad_h), (pad_w, w-new_w-pad_w), (0, 0)), mode='constant')
+            semantic_array = np.pad(semantic_array, ((pad_h, h-new_h-pad_h), (pad_w, w-new_w-pad_w)), mode='constant')
+            instance_array = np.pad(instance_array, ((pad_h, h-new_h-pad_h), (pad_w, w-new_w-pad_w)), mode='constant')
+        
+        augmentations_applied.append(f"scale_{scale:.2f}")
+    
+    # 4. Translation
+    if random.random() < augmentation_params.get('translate_prob', 0.3):
+        h, w = img_array.shape[:2]
+        max_trans = augmentation_params.get('translate_max', 0.1)
+        tx = random.uniform(-max_trans * w, max_trans * w)
+        ty = random.uniform(-max_trans * h, max_trans * h)
+        
+        M = np.float32([[1, 0, tx], [0, 1, ty]])
+        img_array = cv2.warpAffine(img_array, M, (w, h))
+        semantic_array = cv2.warpAffine(semantic_array, M, (w, h), flags=cv2.INTER_NEAREST)
+        instance_array = cv2.warpAffine(instance_array, M, (w, h), flags=cv2.INTER_NEAREST)
+        augmentations_applied.append(f"translate_{tx:.0f}_{ty:.0f}")
+    
+    # Convert back to PIL for photometric augmentations
+    image = Image.fromarray(img_array)
+    semantic_mask = Image.fromarray(semantic_array.astype(semantic_dtype))
+    instance_mask = Image.fromarray(instance_array.astype(instance_dtype))
+    
+    # 5. Brightness
+    if random.random() < augmentation_params.get('brightness_prob', 0.5):
+        factor = random.uniform(
+            augmentation_params.get('brightness_min', 0.7),
+            augmentation_params.get('brightness_max', 1.3)
+        )
+        enhancer = ImageEnhance.Brightness(image)
+        image = enhancer.enhance(factor)
+        augmentations_applied.append(f"brightness_{factor:.2f}")
+    
+    # 6. Contrast
+    if random.random() < augmentation_params.get('contrast_prob', 0.5):
+        factor = random.uniform(
+            augmentation_params.get('contrast_min', 0.7),
+            augmentation_params.get('contrast_max', 1.3)
+        )
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(factor)
+        augmentations_applied.append(f"contrast_{factor:.2f}")
+    
+    # 7. Saturation
+    if random.random() < augmentation_params.get('saturation_prob', 0.5):
+        factor = random.uniform(
+            augmentation_params.get('saturation_min', 0.5),
+            augmentation_params.get('saturation_max', 1.5)
+        )
+        enhancer = ImageEnhance.Color(image)
+        image = enhancer.enhance(factor)
+        augmentations_applied.append(f"saturation_{factor:.2f}")
+    
+    # 8. Hue Shift
+    if random.random() < augmentation_params.get('hue_prob', 0.3):
+        img_array = np.array(image)
+        hsv = cv2.cvtColor(img_array, cv2.COLOR_RGB2HSV).astype(np.float32)
+        hue_shift = random.uniform(
+            augmentation_params.get('hue_min', -15),
+            augmentation_params.get('hue_max', 15)
+        )
+        hsv[:, :, 0] = (hsv[:, :, 0] + hue_shift) % 180
+        img_array = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+        image = Image.fromarray(img_array)
+        augmentations_applied.append(f"hue_{hue_shift:.1f}")
+    
+    # 9. Gaussian Blur
+    if random.random() < augmentation_params.get('blur_prob', 0.2):
+        radius = random.uniform(
+            augmentation_params.get('blur_min', 0.5),
+            augmentation_params.get('blur_max', 2.0)
+        )
+        image = image.filter(ImageFilter.GaussianBlur(radius=radius))
+        augmentations_applied.append(f"blur_{radius:.1f}")
+    
+    # 10. Noise
+    if random.random() < augmentation_params.get('noise_prob', 0.2):
+        img_array = np.array(image)
+        noise_strength = augmentation_params.get('noise_strength', 0.02)
+        noise = np.random.normal(0, noise_strength * 255, img_array.shape)
+        img_array = np.clip(img_array + noise, 0, 255).astype(np.uint8)
+        image = Image.fromarray(img_array)
+        augmentations_applied.append(f"noise_{noise_strength:.3f}")
+    
+    return image, semantic_mask, instance_mask, augmentations_applied
+
+
+def create_augmented_dataset(original_images_dir, masks_dir, augmented_output_dir, 
+                           augmentation_params=None, augmentations_per_image=8):
+    """
+    Create augmented dataset from original images and masks.
+    """
+    if augmentation_params is None:
+        augmentation_params = {
+            # Geometric augmentations
+            'rotation_prob': 0.7,
+            'rotation_min': -15,
+            'rotation_max': 15,
+            'flip_prob': 0.5,
+            'scale_prob': 0.5,
+            'scale_min': 0.8,
+            'scale_max': 1.2,
+            'translate_prob': 0.3,
+            'translate_max': 0.1,
+            
+            # Photometric augmentations
+            'brightness_prob': 0.6,
+            'brightness_min': 0.7,
+            'brightness_max': 1.3,
+            'contrast_prob': 0.5,
+            'contrast_min': 0.7,
+            'contrast_max': 1.3,
+            'saturation_prob': 0.5,
+            'saturation_min': 0.5,
+            'saturation_max': 1.5,
+            'hue_prob': 0.3,
+            'hue_min': -15,
+            'hue_max': 15,
+            
+            # Other augmentations
+            'blur_prob': 0.2,
+            'blur_min': 0.5,
+            'blur_max': 2.0,
+            'noise_prob': 0.2,
+            'noise_strength': 0.02
+        }
+    
+    # Create main output directory
+    os.makedirs(augmented_output_dir, exist_ok=True)
+    
+    # Create output directories
+    aug_images_dir = os.path.join(augmented_output_dir, 'images')
+    aug_semantic_dir = os.path.join(augmented_output_dir, 'semantic_masks')
+    aug_instance_dir = os.path.join(augmented_output_dir, 'instance_masks')
+    aug_panoptic_dir = os.path.join(augmented_output_dir, 'panoptic_masks')
+    
+    # Create all base directories
+    for dir_path in [aug_images_dir, aug_semantic_dir, aug_instance_dir, aug_panoptic_dir]:
+        os.makedirs(dir_path, exist_ok=True)
+    
+    # Find all semantic masks
+    semantic_masks_dir = os.path.join(masks_dir, 'semantic_masks')
+    instance_masks_dir = os.path.join(masks_dir, 'instance_masks')
+    panoptic_masks_dir = os.path.join(masks_dir, 'panoptic_masks')
+    
+    total_augmented = 0
+    augmentation_log = []
+    
+    for root, dirs, files in os.walk(semantic_masks_dir):
+        for filename in files:
+            if filename.endswith('_semantic.png'):
+                base_name = filename.replace('_semantic.png', '')
+                rel_path = os.path.relpath(root, semantic_masks_dir)
+                plant_type = rel_path if rel_path != '.' else 'unknown'
+                
+                # Create plant-specific directories
+                for dir_path in [aug_images_dir, aug_semantic_dir, aug_instance_dir, aug_panoptic_dir]:
+                    plant_dir = os.path.join(dir_path, plant_type)
+                    os.makedirs(plant_dir, exist_ok=True)
+                
+                # Find original image
+                orig_image_path = None
+                for ext in ['.jpg', '.jpeg', '.png']:
+                    for img_root, _, img_files in os.walk(original_images_dir):
+                        if f"{base_name}{ext}" in img_files:
+                            orig_image_path = os.path.join(img_root, f"{base_name}{ext}")
+                            orig_ext = ext
+                            break
+                    if orig_image_path:
+                        break
+                
+                if not orig_image_path:
+                    print(f"Warning: Original image not found for {base_name}")
+                    continue
+                
+                # Load original image and masks
+                try:
+                    original_image = Image.open(orig_image_path).convert('RGB')
+                    semantic_mask = Image.open(os.path.join(root, filename))
+                    instance_mask = Image.open(os.path.join(instance_masks_dir, plant_type, f"{base_name}_instance.png"))
+                    panoptic_mask = Image.open(os.path.join(panoptic_masks_dir, plant_type, f"{base_name}_panoptic.png"))
+                    
+                    # Copy originals with _original suffix
+                    original_image.save(os.path.join(aug_images_dir, plant_type, f"{base_name}_original{orig_ext}"))
+                    semantic_mask.save(os.path.join(aug_semantic_dir, plant_type, f"{base_name}_original_semantic.png"))
+                    instance_mask.save(os.path.join(aug_instance_dir, plant_type, f"{base_name}_original_instance.png"))
+                    panoptic_mask.save(os.path.join(aug_panoptic_dir, plant_type, f"{base_name}_original_panoptic.png"))
+                    
+                    # Generate augmentations
+                    for aug_idx in range(augmentations_per_image):
+                        aug_image, aug_semantic, aug_instance, augmentations = augment_image_and_masks(
+                            original_image, semantic_mask, instance_mask, augmentation_params
+                        )
+                        
+                        # Recreate panoptic mask from augmented semantic and instance masks
+                        aug_panoptic = create_panoptic_from_masks(aug_semantic, aug_instance)
+                        
+                        # Save augmented versions
+                        aug_suffix = f"_aug{aug_idx:02d}"
+                        aug_image.save(os.path.join(aug_images_dir, plant_type, f"{base_name}{aug_suffix}{orig_ext}"))
+                        aug_semantic.save(os.path.join(aug_semantic_dir, plant_type, f"{base_name}{aug_suffix}_semantic.png"))
+                        aug_instance.save(os.path.join(aug_instance_dir, plant_type, f"{base_name}{aug_suffix}_instance.png"))
+                        aug_panoptic.save(os.path.join(aug_panoptic_dir, plant_type, f"{base_name}{aug_suffix}_panoptic.png"))
+                        
+                        # Copy instance info JSON with updated filename
+                        info_path = os.path.join(instance_masks_dir, plant_type, f"{base_name}_instances.json")
+                        if os.path.exists(info_path):
+                            with open(info_path, 'r') as f:
+                                info_data = json.load(f)
+                            info_data['augmentations'] = augmentations
+                            info_data['original_filename'] = info_data['filename']
+                            info_data['filename'] = f"{base_name}{aug_suffix}{orig_ext}"
+                            
+                            with open(os.path.join(aug_instance_dir, plant_type, f"{base_name}{aug_suffix}_instances.json"), 'w') as f:
+                                json.dump(info_data, f, indent=2)
+                        
+                        augmentation_log.append({
+                            'original': base_name,
+                            'augmented': f"{base_name}{aug_suffix}",
+                            'augmentations': augmentations,
+                            'plant_type': plant_type
+                        })
+                        
+                        total_augmented += 1
+                        
+                    print(f"Generated {augmentations_per_image} augmentations for {base_name}")
+                    
+                except Exception as e:
+                    print(f"Error processing {base_name}: {e}")
+    
+    # Save augmentation log
+    log_path = os.path.join(augmented_output_dir, 'augmentation_log.json')
+    with open(log_path, 'w') as f:
+        json.dump(augmentation_log, f, indent=2)
+    
+    print(f"\nAugmentation complete!")
+    print(f"Total augmented images created: {total_augmented}")
+    print(f"Augmentation log saved to: {log_path}")
+    
+    return total_augmented
+
+
+def create_panoptic_from_masks(semantic_mask, instance_mask):
+    """Recreate panoptic mask from semantic and instance masks"""
+    semantic_array = np.array(semantic_mask)
+    instance_array = np.array(instance_mask)
+    
+    # Create panoptic mask
+    panoptic_array = np.zeros_like(instance_array, dtype=np.uint32)
+    
+    # For each unique instance
+    unique_instances = np.unique(instance_array)
+    for instance_id in unique_instances:
+        if instance_id == 0:  # Skip background
+            continue
+        
+        # Get the semantic class for this instance
+        instance_pixels = instance_array == instance_id
+        semantic_values = semantic_array[instance_pixels]
+        
+        # Use mode (most common) semantic value for this instance
+        if len(semantic_values) > 0:
+            semantic_class = np.bincount(semantic_values).argmax()
+            panoptic_id = semantic_class * 1000 + instance_id
+            panoptic_array[instance_pixels] = panoptic_id
+    
+    return Image.fromarray(panoptic_array)
+
+
+def validate_augmented_dataset(augmented_dir):
+    """Validate the augmented dataset structure and consistency"""
+    issues = []
+    
+    images_dir = os.path.join(augmented_dir, 'images')
+    semantic_dir = os.path.join(augmented_dir, 'semantic_masks')
+    instance_dir = os.path.join(augmented_dir, 'instance_masks')
+    panoptic_dir = os.path.join(augmented_dir, 'panoptic_masks')
+    
+    # Count files in each directory
+    image_files = set()
+    semantic_files = set()
+    instance_files = set()
+    panoptic_files = set()
+    
+    for root, _, files in os.walk(images_dir):
+        for f in files:
+            if f.endswith(('.jpg', '.jpeg', '.png')):
+                base = os.path.splitext(f)[0]
+                image_files.add(base)
+    
+    for root, _, files in os.walk(semantic_dir):
+        for f in files:
+            if f.endswith('_semantic.png'):
+                base = f.replace('_semantic.png', '')
+                semantic_files.add(base)
+    
+    for root, _, files in os.walk(instance_dir):
+        for f in files:
+            if f.endswith('_instance.png'):
+                base = f.replace('_instance.png', '')
+                instance_files.add(base)
+    
+    for root, _, files in os.walk(panoptic_dir):
+        for f in files:
+            if f.endswith('_panoptic.png'):
+                base = f.replace('_panoptic.png', '')
+                panoptic_files.add(base)
+    
+    # Check consistency
+    if image_files != semantic_files:
+        issues.append(f"Mismatch between images and semantic masks")
+    if image_files != instance_files:
+        issues.append(f"Mismatch between images and instance masks")
+    if image_files != panoptic_files:
+        issues.append(f"Mismatch between images and panoptic masks")
+    
+    print(f"\nValidation Results:")
+    print(f"Images: {len(image_files)}")
+    print(f"Semantic masks: {len(semantic_files)}")
+    print(f"Instance masks: {len(instance_files)}")
+    print(f"Panoptic masks: {len(panoptic_files)}")
+    
+    if issues:
+        print("\nIssues found:")
+        for issue in issues:
+            print(f"  - {issue}")
+    else:
+        print("\nNo issues found! Dataset is consistent.")
+    
+    return len(issues) == 0
+
+
 def visualize_instance_masks(semantic_path, instance_path, panoptic_path, save_path=None):
     """Visualize the three types of masks"""
     import matplotlib.pyplot as plt
@@ -421,6 +811,7 @@ def visualize_instance_masks(semantic_path, instance_path, panoptic_path, save_p
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
+
 
 # Enhanced dataset class for instance segmentation training
 class InstanceSegmentationDataset:
@@ -507,16 +898,20 @@ class InstanceSegmentationDataset:
             'instance_info': instance_info
         }
 
+
 # Main execution
 if __name__ == "__main__":
     json_file = "via_export_json(4).json"
     original_images_dir = "Pictures/"
     
+    classes_to_skip = ['lettuce', 'raspberry', 'pear', 'pepper']
+    
     print("=== STEP 1: Creating Instance-Aware Masks at Original Sizes ===")
+    print(f"SKIPPING CLASSES: {classes_to_skip}")
     output_dir = "InstanceMasks/"
     
     processed, total_instances = create_instance_masks_from_json(
-        json_file, original_images_dir, output_dir
+        json_file, original_images_dir, output_dir, skip_classes=classes_to_skip
     )
     
     print(f"\n   Successfully created instance masks!")
@@ -528,7 +923,8 @@ if __name__ == "__main__":
     print(f"\n   Statistics:")
     print(f"   Images processed: {processed}")
     print(f"   Individual fruits labeled: {total_instances}")
-    print(f"   Average fruits per image: {total_instances/processed:.1f}")
+    if processed > 0:
+        print(f"   Average fruits per image: {total_instances/processed:.1f}")
     
     print("\n=== STEP 2: Smart Resizing Images and Masks to 1200x1200 ===")
     resized_images_dir = "RePictures/"
@@ -541,11 +937,32 @@ if __name__ == "__main__":
         target_resolution
     )
     
+    print("\n=== STEP 3: Creating Augmented Dataset ===")
+    
+    # Use the resized images and masks for augmentation
+    augmented_output_dir = "AugmentedDataset/"
+    
+    # Create augmented dataset
+    augmentations_per_image = 8  # This will give you 9x total (1 original + 8 augmented)
+    
+    total_augmented = create_augmented_dataset(
+        resized_images_dir,
+        resized_masks_dir,
+        augmented_output_dir,
+        augmentations_per_image=augmentations_per_image
+    )
+    
+    print(f"\nCreated {total_augmented} augmented images!")
+    print(f"Total dataset size: ~{total_augmented + processed} images")
+    
+    # Validate the augmented dataset
+    print("\n=== STEP 4: Validating Augmented Dataset ===")
+    is_valid = validate_augmented_dataset(augmented_output_dir)
+    
     print("\n=== COMPLETE ===")
     print("You now have:")
     print("- Original size instance masks in InstanceMasks/")
     print("- 1200x1200 images in RePictures/")
     print("- 1200x1200 instance masks in ReInstanceMasks/")
-    print("  - ReInstanceMasks/semantic_masks/")
-    print("  - ReInstanceMasks/instance_masks/")
-    print("  - ReInstanceMasks/panoptic_masks/")
+    print(f"- Augmented dataset in AugmentedDataset/ (~{total_augmented + processed} total images)")
+    print(f"EXCLUDED CLASSES: {classes_to_skip}")
