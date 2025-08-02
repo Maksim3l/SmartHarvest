@@ -6,3 +6,7 @@ Model_env
 instance_checkpoints
 Pictures
 ResizedExtendingPictures
+AugmentedDataset
+Models/*.jpg
+Models/*.png
+Models/*.pth
