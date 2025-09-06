@@ -101,25 +101,25 @@ class FruitInstanceDataset(Dataset):
         print(f"Augmentation: {'Enabled' if self.augment else 'Disabled'}")
         
     def _load_samples(self):
-        """Load all valid samples from mask directories"""
+        """Load all valid samples from mask directories with improved path handling"""
         semantic_dir = os.path.join(self.masks_dir, 'semantic_masks')
         instance_dir = os.path.join(self.masks_dir, 'instance_masks')
-        
+
         if not os.path.exists(semantic_dir) or not os.path.exists(instance_dir):
             raise ValueError(f"Mask directories not found in {self.masks_dir}")
-        
+
         # Walk through semantic masks
         for root, dirs, files in os.walk(semantic_dir):
             for filename in files:
                 if not filename.endswith('_semantic.png'):
                     continue
-                    
+
                 base_name = filename.replace('_semantic.png', '')
-                
-                # Get plant type from directory
+
+                # Get plant type from directory structure
                 rel_path = os.path.relpath(root, semantic_dir)
                 plant_type = rel_path if rel_path != '.' else 'unknown'
-                
+
                 # Skip excluded fruits
                 if plant_type in self.skip_fruits:
                     continue
@@ -128,35 +128,71 @@ class FruitInstanceDataset(Dataset):
                 if plant_type not in self.class_map:
                     continue
                 
-                # Build paths
+                # Build paths for masks and info
                 semantic_path = os.path.join(root, filename)
-                instance_path = os.path.join(root.replace(semantic_dir, instance_dir), 
-                                           f"{base_name}_instance.png")
-                info_path = os.path.join(root.replace(semantic_dir, instance_dir), 
-                                       f"{base_name}_instances.json")
-                
-                # Find original image
+                instance_path = os.path.join(instance_dir, plant_type, f"{base_name}_instance.png")
+                info_path = os.path.join(instance_dir, plant_type, f"{base_name}_instances.json")
+
+                # Find original image - it should be in images/plant_type/
                 image_path = None
-                for ext in ['.jpg', '.jpeg', '.png', '.bmp']:
-                    for img_root, _, img_files in os.walk(self.images_dir):
-                        if f"{base_name}{ext}" in img_files:
-                            image_path = os.path.join(img_root, f"{base_name}{ext}")
-                            break
-                    if image_path:
+
+                # The image should be in images/plant_type/ with the same base name
+                for ext in ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG']:
+                    potential_path = os.path.join(self.images_dir, plant_type, f"{base_name}{ext}")
+                    if os.path.exists(potential_path):
+                        image_path = potential_path
                         break
-                
-                # Verify all files exist
-                if (image_path and os.path.exists(image_path) and 
-                    os.path.exists(semantic_path) and os.path.exists(instance_path)):
                     
+                # If not found with standard extensions, check if base_name already has extension
+                if image_path is None:
+                    direct_path = os.path.join(self.images_dir, plant_type, base_name)
+                    if os.path.exists(direct_path):
+                        image_path = direct_path
+
+                # Verify all required files exist
+                required_files = {
+                    'image': image_path,
+                    'semantic': semantic_path,
+                    'instance': instance_path,
+                    'info': info_path
+                }
+
+                missing = [k for k, v in required_files.items() if v is None or not os.path.exists(v)]
+
+                # For augmented dataset, info file should always exist
+                if len(missing) == 0:
                     self.samples.append({
                         'image_path': image_path,
                         'semantic_path': semantic_path,
                         'instance_path': instance_path,
-                        'info_path': info_path if os.path.exists(info_path) else None,
+                        'info_path': info_path,
                         'plant_type': plant_type,
                         'base_name': base_name
                     })
+                else:
+                    # Only print detailed error for non-info files
+                    if missing != ['info']:
+                        print(f"Skipping {base_name} - missing files: {missing}")
+                        if 'image' in missing:
+                            print(f"  Expected image at: {image_path}")
+                            # List what's actually in the directory
+                            img_dir = os.path.join(self.images_dir, plant_type)
+                            if os.path.exists(img_dir):
+                                files_in_dir = os.listdir(img_dir)
+                                matching_files = [f for f in files_in_dir if base_name in f]
+                                if matching_files:
+                                    print(f"  Found similar files: {matching_files[:5]}")
+
+        print(f"\nDataset loading complete:")
+        print(f"  Total samples found: {len(self.samples)}")
+        if self.samples:
+            # Show sample paths for debugging
+            print(f"\nSample paths (first entry):")
+            first_sample = self.samples[0]
+            print(f"  Image: {first_sample['image_path']}")
+            # print(f"  Semantic: {first_sample['semantic_path']}")
+            # print(f"  Instance: {first_sample['instance_path']}")
+            # print(f"  Info: {first_sample['info_path']}")
     
     def __len__(self):
         return len(self.samples)
@@ -950,10 +986,11 @@ def analyze_model_performance(model_path, val_loader, device='cuda', num_samples
 def main():
     """Main execution function"""
     config = {
-        'images_dir': 'RePictures/',
-        'masks_dir': 'ReInstanceMasks/',
+        # When using augmented dataset, point to AugmentedDataset folder
+        'images_dir': 'AugmentedDataset/images/',
+        'masks_dir': 'AugmentedDataset/',  # Parent directory containing semantic_masks, instance_masks
         'save_dir': 'fruit_detection_model_enhanced',
-        'use_augmented_dataset': True,  # Use augmented dataset from MakeMaskInstanceSemanticDataset.py
+        'use_augmented_dataset': True,
         
         # Model parameters
         'num_classes': 16,  # 1 background + 15 fruit-ripeness combinations
@@ -993,11 +1030,29 @@ def main():
     # Check if directories exist
     if not os.path.exists(config['images_dir']):
         print(f"Error: Images directory '{config['images_dir']}' not found!")
+        print(f"Current working directory: {os.getcwd()}")
+        print(f"Contents of current directory: {os.listdir('.')}")
         return
     
     if not os.path.exists(config['masks_dir']):
         print(f"Error: Masks directory '{config['masks_dir']}' not found!")
         return
+    
+    # Print directory structure for debugging
+    print("\nDirectory structure check:")
+    print(f"Images dir exists: {os.path.exists(config['images_dir'])}")
+    print(f"Masks dir exists: {os.path.exists(config['masks_dir'])}")
+    
+    # Check subdirectories
+    semantic_dir = os.path.join(config['masks_dir'], 'semantic_masks')
+    instance_dir = os.path.join(config['masks_dir'], 'instance_masks')
+    print(f"Semantic masks dir exists: {os.path.exists(semantic_dir)}")
+    print(f"Instance masks dir exists: {os.path.exists(instance_dir)}")
+    
+    # List plant types found
+    if os.path.exists(semantic_dir):
+        plant_types = [d for d in os.listdir(semantic_dir) if os.path.isdir(os.path.join(semantic_dir, d))]
+        print(f"Plant types found: {plant_types}")
     
     # Check for resume
     resume_checkpoint = None
@@ -1016,23 +1071,49 @@ def main():
         model = train_model(config, resume_from=resume_checkpoint)
         print("\n Training completed successfully!")
         
+        # Test on sample images
         test_images = []
-        search_dir = 'AugmentedDataset/images/' if config['use_augmented_dataset'] else config['images_dir']
         
+        # Look for test images in the augmented dataset
+        search_dir = config['images_dir']
+        
+        # Get a few original images for testing (those with _original suffix)
         for root, dirs, files in os.walk(search_dir):
             for file in files:
-                if file.lower().endswith(('.jpg', '.jpeg', '.png')) and 'original' in file:
+                if '_original' in file and file.lower().endswith(('.jpg', '.jpeg', '.png')):
                     test_images.append(os.path.join(root, file))
                     if len(test_images) >= 5:
                         break
+            if len(test_images) >= 5:
+                break
+        
+        # If no original images found, just take any images
+        if not test_images:
+            for root, dirs, files in os.walk(search_dir):
+                for file in files:
+                    if file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                        test_images.append(os.path.join(root, file))
+                        if len(test_images) >= 5:
+                            break
+                if len(test_images) >= 5:
+                    break
         
         if test_images:
             print(f"\nTesting on {len(test_images)} sample images...")
             model_path = os.path.join(config['save_dir'], 'best_model.pth')
             
-            for test_img in test_images[:3]:
+            if not os.path.exists(model_path):
+                print("Best model not found, using final model...")
+                model_path = os.path.join(config['save_dir'], 'final_model.pth')
+            
+            for test_img in test_images[:3]:  # Test on first 3 images
                 print(f"\nTesting: {os.path.basename(test_img)}")
-                test_model(model_path, test_img, config['device'])
+                try:
+                    test_model(model_path, test_img, config['device'])
+                except Exception as e:
+                    print(f"Error testing image {test_img}: {e}")
+        else:
+            print("\nNo test images found in the dataset.")
                 
     except KeyboardInterrupt:
         print("\n Training interrupted by user")

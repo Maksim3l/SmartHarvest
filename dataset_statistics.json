@@ -1,0 +1,181 @@
+{
+  "Total Images": 875,
+  "Total Annotations": 7368,
+  "Skipped Images": 0,
+  "Null Regions": 1,
+  "Images per Plant Type": {
+    "apple": 98,
+    "tomato": 94,
+    "strawberry": 111,
+    "peppers": 13,
+    "unknown": 323,
+    "pepers": 7,
+    "pear": 3,
+    "cucumber": 97,
+    "raspberry": 41,
+    "lettuce": 2,
+    "cherry": 86
+  },
+  "Annotations per Plant Type": {
+    "apple": 2582,
+    "tomato": 1572,
+    "strawberry": 1397,
+    "peppers": 50,
+    "pepers": 63,
+    "pear": 10,
+    "cucumber": 464,
+    "raspberry": 218,
+    "unknown": 22,
+    "lettuce": 21,
+    "cherry": 969
+  },
+  "Ripeness Distribution": {
+    "apple": {
+      "ripe": 669,
+      "spoiled": 78,
+      "unripe": 91,
+      "obscured": 1744
+    },
+    "tomato": {
+      "obscured": 952,
+      "unripe": 322,
+      "ripe": 271,
+      "spoiled": 27
+    },
+    "strawberry": {
+      "unripe": 485,
+      "ripe": 382,
+      "obscured": 493,
+      "spoiled": 37
+    },
+    "peppers": {
+      "ripe": 39,
+      "obscured": 10,
+      "spoiled": 1
+    },
+    "pepers": {
+      "ripe": 12,
+      "obscured": 48,
+      "unripe": 3
+    },
+    "pear": {
+      "ripe": 10
+    },
+    "cucumber": {
+      "ripe": 199,
+      "obscured": 206,
+      "unripe": 51,
+      "spoiled": 8
+    },
+    "raspberry": {
+      "ripe": 203,
+      "obscured": 8,
+      "unripe": 6,
+      "spoiled": 1
+    },
+    "unknown": {
+      "ripe": 22
+    },
+    "lettuce": {
+      "ripe": 21
+    },
+    "cherry": {
+      "unripe": 175,
+      "spoiled": 61,
+      "obscured": 501,
+      "ripe": 232
+    }
+  },
+  "Overall Ripeness": {
+    "ripe": 2060,
+    "spoiled": 213,
+    "unripe": 1133,
+    "obscured": 3962
+  },
+  "Average Annotations per Image": {
+    "apple": {
+      "mean": 30.376470588235293,
+      "std": 66.76243686219479,
+      "min": 1,
+      "max": 433
+    },
+    "tomato": {
+      "mean": 21.534246575342465,
+      "std": 23.763724047310742,
+      "min": 1,
+      "max": 137
+    },
+    "strawberry": {
+      "mean": 15.351648351648352,
+      "std": 18.21867995988565,
+      "min": 1,
+      "max": 91
+    },
+    "peppers": {
+      "mean": 5.0,
+      "std": 4.8166378315169185,
+      "min": 1,
+      "max": 16
+    },
+    "pepers": {
+      "mean": 15.75,
+      "std": 19.48557158514987,
+      "min": 1,
+      "max": 49
+    },
+    "pear": {
+      "mean": 10.0,
+      "std": 0.0,
+      "min": 10,
+      "max": 10
+    },
+    "cucumber": {
+      "mean": 6.025974025974026,
+      "std": 8.817005449143968,
+      "min": 1,
+      "max": 60
+    },
+    "raspberry": {
+      "mean": 9.083333333333334,
+      "std": 8.179836320014125,
+      "min": 2,
+      "max": 38
+    },
+    "unknown": {
+      "mean": 7.333333333333333,
+      "std": 4.0276819911981905,
+      "min": 4,
+      "max": 13
+    },
+    "lettuce": {
+      "mean": 10.5,
+      "std": 9.5,
+      "min": 1,
+      "max": 20
+    },
+    "cherry": {
+      "mean": 14.907692307692308,
+      "std": 12.096691317397596,
+      "min": 2,
+      "max": 58
+    }
+  },
+  "Polygon Complexity": {
+    "mean_vertices": 14.06772529858849,
+    "std_vertices": 9.826115827899718,
+    "min_vertices": 3,
+    "max_vertices": 126
+  },
+  "Bounding Box Stats": {
+    "mean_width": 71.40594462540717,
+    "mean_height": 78.76058631921823,
+    "std_width": 114.99448177504595,
+    "std_height": 126.80383363709237
+  },
+  "Area Stats": {
+    "mean_area": 12450.024022801303,
+    "std_area": 73322.59605909289,
+    "min_area": 3.0,
+    "max_area": 2674928.0
+  }
+}
